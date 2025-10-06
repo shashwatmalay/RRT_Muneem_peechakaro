@@ -1,0 +1,47 @@
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql" // ya jo bhi tum use kar rahe ho
+  url      = env("DATABASE_URL")
+}
+
+// -------------------- CANDIDATE TABLE --------------------
+model Candidate {
+  id            Int          @id @default(autoincrement())
+  email         String       @unique
+  name          String
+  count         Int          @default(0)
+  platformCount Int          @default(0)
+  companyCount  Int          @default(0)
+  createdAt     DateTime     @default(now())
+  accessToken   String?      @db.Text
+  refreshToken  String?      @db.Text
+  messages      Message[]    
+
+}
+
+// -------------------- MESSAGE TABLE --------------------
+model Message {
+  id          String    @id              // Gmail message ID
+  candidateId Int
+  candidate   Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  createdAt   DateTime  @default(now())  // message received date
+  from        String?   // jai ho
+
+  @@map("messages")
+}
+
+
+model Admin {
+  id        Int      @id @default(autoincrement())
+  username  String   @unique
+  password  String
+  question  String   @default("What happened on your birthday?")
+  answer    String   @default("neeravtooatecake")
+  createdAt DateTime @default(now())
+}
+
+
