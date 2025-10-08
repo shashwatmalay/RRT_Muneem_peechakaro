@@ -6,6 +6,7 @@ const { google } = require("googleapis");
 const cron = require("node-cron");
 const jwt = require("jsonwebtoken");
 const moment = require("moment-timezone");
+const pLimit = require("p-limit").default;
 
 const prisma = new PrismaClient();
 const app = express();
@@ -15,29 +16,137 @@ app.use(express.json());
 const PORT = process.env.PORT || 5000;
 const CLIENT_ID = process.env.CLIENT_ID || "";
 const CLIENT_SECRET = process.env.CLIENT_SECRET || "";
-const REDIRECT_URI = process.env.REDIRECT_URI || "http://localhost:5000/oauth2callback";
-const CRON_INTERVAL = process.env.CRON_INTERVAL || 2; // in minutes
+const REDIRECT_URI =
+  process.env.REDIRECT_URI || "http://localhost:5000/oauth2callback";
+const CRON_INTERVAL = process.env.CRON_INTERVAL || 2; // minutes
+const PARALLEL_LIMIT = parseInt(process.env.PARALLEL_LIMIT || "8", 10); // default 8
+const PER_MESSAGE_LIMIT = parseInt(process.env.PER_MESSAGE_LIMIT || "5", 10); // per-candidate message fetch concurrency
 
-// -------------------- HEALTH CHECK --------------------
+let isCronRunning = false;
+const deletedCandidates = new Set();
+
+// -------------------- HELPERS --------------------
+function log(...args) {
+  console.log(new Date().toISOString(), ...args);
+}
+
+function detectMailSource(fromEmail) {
+  if (!fromEmail || fromEmail === "Unknown") return "company";
+  const email = fromEmail.toLowerCase();
+  const platforms = [
+    "linkedin.com",
+    "indeed.com",
+    "glassdoor.com",
+    "simplyhired.com",
+    "dice.com",
+    "monster.com",
+    "careerbuilder.com",
+    "apexsystems.com",
+    "ziprecruiter.com",
+    "randstad.com",
+    "roberthalf.com",
+    "brooksource.com",
+    "insightglobal.com",
+    "teksystems.com",
+    "kforce.com",
+    "levels.fyi",
+    "talenty.io",
+    "jobright.com",
+    "swooped.com",
+    "simplify.com",
+    "builtin.com",
+    "workable.com",
+  ];
+  return platforms.some((d) => email.includes(d)) ? "platform" : "company";
+}
+
+function extractAllTextFromPayload(payload) {
+  let acc = "";
+  function walk(part) {
+    if (!part) return;
+    if (part.body && part.body.data) {
+      try {
+        acc += Buffer.from(part.body.data, "base64").toString("utf-8") + " ";
+      } catch (e) {}
+    }
+    if (part.parts && Array.isArray(part.parts)) part.parts.forEach(walk);
+  }
+  walk(payload);
+  acc = acc.replace(/<[^>]+>/g, " ");
+  acc = acc.replace(/&nbsp;|&amp;|&lt;|&gt;|&quot;|&#39;/g, " ");
+  return acc;
+}
+
+// Recompute exact counts from messages table and write into candidate row (atomic-ish)
+async function updateCandidateCounts(candidateId) {
+  // Count all messages for candidate
+  const total = await prisma.message.count({ where: { candidateId } });
+  // Count platform messages
+  // We can't do detectMailSource inside DB, so fetch counts grouped by source in JS:
+  const msgs = await prisma.message.findMany({
+    where: { candidateId },
+    select: { from: true },
+  });
+  let platformCount = 0;
+  for (const m of msgs)
+    if (detectMailSource(m.from) === "platform") platformCount++;
+  const companyCount = total - platformCount;
+
+  await prisma.candidate.update({
+    where: { id: candidateId },
+    data: { count: total, platformCount, companyCount },
+  });
+  log(
+    `Counts updated for candidate ${candidateId}: total=${total}, platform=${platformCount}, company=${companyCount}`
+  );
+}
+
+// Get today's counts grouped by candidate (EST) — used for GET /candidates dailyCount
+async function getTodayCountsGrouped() {
+  const startEST = moment.tz("America/New_York").startOf("day").utc().toDate();
+  const endEST = moment.tz("America/New_York").endOf("day").utc().toDate();
+
+  // Group by candidateId: prisma.groupBy
+  // NOTE: groupBy available in Prisma; this returns array of { candidateId, _count: { id } }
+  const groups = await prisma.message.groupBy({
+    by: ["candidateId"],
+    where: { createdAt: { gte: startEST, lte: endEST } },
+    _count: { id: true },
+  });
+
+  const map = {};
+  for (const g of groups) map[g.candidateId] = g._count.id;
+  return map;
+}
+
+// -------------------- ROUTES --------------------
 app.get("/", (req, res) => res.send({ status: "ok" }));
 
-// -------------------- LOGIN --------------------
 app.post("/login", async (req, res) => {
   const { username, password } = req.body;
   try {
     const admin = await prisma.admin.findFirst();
-    if (!admin) return res.status(404).json({ error: "No admin found. Please set credentials first via Forgot Password." });
+    if (!admin)
+      return res
+        .status(404)
+        .json({
+          error:
+            "No admin found. Please set credentials first via Forgot Password.",
+        });
     if (admin.username !== username || admin.password !== password)
       return res.status(401).json({ error: "Invalid username or password" });
-    const token = jwt.sign({ username }, "supersecretkey", { expiresIn: "1h" });
+    const token = jwt.sign(
+      { username },
+      process.env.JWT_SECRET || "supersecretkey",
+      { expiresIn: "1h" }
+    );
     res.json({ token, username });
   } catch (err) {
-    console.error("Login error:", err);
+    log("Login error:", err);
     res.status(500).json({ error: "Login failed" });
   }
 });
 
-// -------------------- FORGOT PASSWORD (get question) --------------------
 app.post("/forgot-password-question", async (req, res) => {
   try {
     let admin = await prisma.admin.findFirst();
@@ -53,35 +162,32 @@ app.post("/forgot-password-question", async (req, res) => {
     }
     res.json({ question: admin.question });
   } catch (err) {
-    console.error("Forgot question error:", err);
+    log("Forgot question error:", err);
     res.status(500).json({ error: "Failed to get question" });
   }
 });
 
-// -------------------- VERIFY ANSWER --------------------
 app.post("/verify-answer", async (req, res) => {
   const { answer } = req.body;
   try {
     const admin = await prisma.admin.findFirst();
     if (!admin) return res.status(404).json({ error: "No admin found" });
-
-    const provided = (answer || "").trim().toLowerCase();
-    const stored = (admin.answer || "").trim().toLowerCase();
-
-    if (provided !== stored) return res.status(401).json({ error: "Incorrect answer" });
+    if (
+      (answer || "").trim().toLowerCase() !==
+      (admin.answer || "").trim().toLowerCase()
+    )
+      return res.status(401).json({ error: "Incorrect answer" });
     res.json({ success: true });
   } catch (err) {
-    console.error("Verify answer error:", err);
+    log("Verify answer error:", err);
     res.status(500).json({ error: "Verification failed" });
   }
 });
 
-// -------------------- RESET CREDENTIALS --------------------
 app.post("/reset-credentials", async (req, res) => {
   const { newUsername, newPassword, confirmPassword } = req.body;
   if (newPassword !== confirmPassword)
     return res.status(400).json({ error: "Passwords do not match" });
-
   try {
     let admin = await prisma.admin.findFirst();
     if (!admin) {
@@ -101,47 +207,59 @@ app.post("/reset-credentials", async (req, res) => {
     }
     res.json({ success: true, message: "Credentials updated successfully" });
   } catch (err) {
-    console.error("Reset credentials error:", err);
+    log("Reset credentials error:", err);
     res.status(500).json({ error: "Failed to update credentials" });
   }
 });
 
-// -------------------- ADD CANDIDATE --------------------
 app.post("/candidates", async (req, res) => {
   const { name, email } = req.body;
   if (!name || !email)
     return res.status(400).json({ error: "name and email required" });
-
   try {
     const newCandidate = await prisma.candidate.create({
-      data: { name, email, count: 0, platformCount: 0, companyCount: 0 },
+      data: {
+        name,
+        email: email.toLowerCase().trim(),
+        count: 0,
+        platformCount: 0,
+        companyCount: 0,
+      },
     });
     res.status(201).json(newCandidate);
   } catch (err) {
-    console.error("Error adding candidate:", err.message || err);
+    log("Error adding candidate:", err);
     if (err.code === "P2002")
-      return res.status(409).json({ error: "Candidate with this email already exists" });
+      return res
+        .status(409)
+        .json({ error: "Candidate with this email already exists" });
     res.status(500).json({ error: "Failed to add candidate" });
   }
 });
 
-// -------------------- DELETE CANDIDATE --------------------
 app.delete("/candidates/:id", async (req, res) => {
   try {
-    const { id } = req.params;
-    await prisma.message.deleteMany({ where: { candidateId: parseInt(id) } });
-    await prisma.candidate.delete({ where: { id: parseInt(id) } });
+    const id = parseInt(req.params.id);
+    await prisma.$transaction([
+      prisma.message.deleteMany({ where: { candidateId: id } }),
+      prisma.candidate.delete({ where: { id } }),
+    ]);
+    deletedCandidates.add(id);
     res.json({ success: true, message: "Candidate deleted" });
   } catch (err) {
-    console.error("Delete candidate error:", err.message || err);
+    log("Delete candidate error:", err);
     res.status(500).json({ error: "Failed to delete candidate" });
   }
 });
 
-// -------------------- AUTH --------------------
-app.get("/auth/:candidateId", async (req, res) => {
+// OAuth routes
+app.get("/auth/:candidateId", (req, res) => {
   const { candidateId } = req.params;
-  const oAuth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
+  const oAuth2Client = new google.auth.OAuth2(
+    CLIENT_ID,
+    CLIENT_SECRET,
+    REDIRECT_URI
+  );
   const authUrl = oAuth2Client.generateAuthUrl({
     access_type: "offline",
     scope: ["https://www.googleapis.com/auth/gmail.readonly"],
@@ -157,19 +275,29 @@ app.get("/oauth2callback", async (req, res) => {
     const candidateId = req.query.state;
     if (!code || !candidateId)
       return res.status(400).send("Missing code or state.");
-
-    const oAuth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
+    const oAuth2Client = new google.auth.OAuth2(
+      CLIENT_ID,
+      CLIENT_SECRET,
+      REDIRECT_URI
+    );
     const { tokens } = await oAuth2Client.getToken(code);
     oAuth2Client.setCredentials(tokens);
-
-    const profile = await google.gmail({ version: "v1", auth: oAuth2Client }).users.getProfile({ userId: "me" });
+    const profile = await google
+      .gmail({ version: "v1", auth: oAuth2Client })
+      .users.getProfile({ userId: "me" });
     const googleEmail = profile?.data?.emailAddress || "";
-
-    const candidate = await prisma.candidate.findUnique({ where: { id: parseInt(candidateId) } });
+    const candidate = await prisma.candidate.findUnique({
+      where: { id: parseInt(candidateId) },
+    });
     if (!candidate) return res.status(404).send("Candidate not found.");
-    if (candidate.email.toLowerCase().trim() !== googleEmail.toLowerCase().trim())
-      return res.status(400).send(`Authorized Google account (${googleEmail}) does not match candidate email (${candidate.email}).`);
-
+    if (
+      candidate.email.toLowerCase().trim() !== googleEmail.toLowerCase().trim()
+    )
+      return res
+        .status(400)
+        .send(
+          `Authorized Google account (${googleEmail}) does not match candidate email (${candidate.email}).`
+        );
     await prisma.candidate.update({
       where: { id: candidate.id },
       data: {
@@ -177,218 +305,373 @@ app.get("/oauth2callback", async (req, res) => {
         refreshToken: tokens.refresh_token || null,
       },
     });
-
     res.send("✅ OAuth Success — account verified and tokens saved.");
   } catch (err) {
-    console.error("OAuth callback error:", err.message || err);
+    log("OAuth callback error:", err);
     res.status(500).send("OAuth failed");
   }
 });
 
-// -------------------- DETECT MAIL SOURCE --------------------
-function detectMailSource(fromEmail) {
-  if (!fromEmail || fromEmail === "Unknown") return "company";
-  const email = fromEmail.toLowerCase();
-  const platforms = [
-    "linkedin.com","indeed.com","glassdoor.com","simplyhired.com","dice.com",
-    "monster.com","careerbuilder.com","apexsystems.com","ziprecruiter.com",
-    "randstad.com","roberthalf.com","brooksource.com","insightglobal.com",
-    "teksystems.com","kforce.com","levels.fyi","talenty.io","jobright.com",
-    "swooped.com","simplify.com","builtin.com","workable.com"
-  ];
-  return platforms.some(domain => email.includes(domain)) ? "platform" : "company";
-}
-
-// -------------------- EXTRACT TEXT --------------------
-function extractAllTextFromPayload(payload) {
-  let acc = "";
-  function walk(part) {
-    if (!part) return;
-    if (part.body && part.body.data) {
-      try { acc += Buffer.from(part.body.data, "base64").toString("utf-8") + " "; } catch(e){}
-    }
-    if (part.parts && Array.isArray(part.parts)) part.parts.forEach(walk);
-  }
-  walk(payload);
-  acc = acc.replace(/<[^>]+>/g, " ");
-  acc = acc.replace(/&nbsp;|&amp;|&lt;|&gt;|&quot;|&#39;/g, " ");
-  return acc;
-}
-
-// -------------------- CHECK MAILS & UPDATE COUNT --------------------
+// -------------------- MAIL CHECK & PROCESS --------------------
 async function checkMailsAndUpdateCount() {
+  if (isCronRunning) {
+    log("Cron already running — skipping this run.");
+    return;
+  }
+  isCronRunning = true;
+  log("Cron started.");
+
   const subjects = [
-    "Thank you for applying","Thank you for applying!","Thanks for applying",
-    "We received your","Application Received","Your application for the position",
-    "Your recent application for the position","we've received","We have successfully received your application",
-    "Submitted:","we have received","submitted","your application was sent",
-    "Submission","Thank you for your application","Thank you for your application!",
-    "Thank you for the application","Application was received","Thanks for your application",
-    "Thanks for completing your application","has been received","Indeed Application:",
-    "We received your application","we received your job application",
-    "we received job application","Application Acknowledgement","Thank you for your interest",
-    "Thank you for your job application","your resume was received","Thank you for submitting your application"
+    "Thank you for applying",
+    "Thank you for applying!",
+    "Thanks for applying",
+    "We received your",
+    "Application Received",
+    "Your application for the position",
+    "Your recent application for the position",
+    "we've received",
+    "We have successfully received your application",
+    "Submitted:",
+    "we have received",
+    "submitted",
+    "your application was sent",
+    "Submission",
+    "Thank you for your application",
+    "Thank you for your application!",
+    "Thank you for the application",
+    "Application was received",
+    "Thanks for your application",
+    "Thanks for completing your application",
+    "has been received",
+    "Indeed Application:",
+    "We received your application",
+    "we received your job application",
+    "we received job application",
+    "Application Acknowledgement",
+    "Thank you for your interest",
+    "Thank you for your job application",
+    "your resume was received",
+    "Thank you for submitting your application",
   ];
-  const query = "subject:(" + subjects.map(s => `"${s}"`).join(" OR ") + ")";
+  const query = "subject:(" + subjects.map((s) => `"${s}"`).join(" OR ") + ")";
   const maxFetch = 100000;
-  const rejectRegex = /(not|won't|unable|unfortunate|unfortunately|unfortunately,|pursue other candidates|with other candidates|regret to inform|declined|position has been filled|no longer under consideration|unfortunate|another candidate)/i;
-  // const forwardRegex = /forwarded message|-----original message-----/i;
+  const rejectRegex =
+    /(not|won't|unable|unfortunate|unfortunately| other candidates|with other candidates|regret to inform|declined|position has been filled|no longer under consideration|another candidate)/i;
 
-  const candidates = await prisma.candidate.findMany({ where: { refreshToken: { not: null } } });
-  if (!candidates || candidates.length === 0) return;
+  try {
+    const candidates = await prisma.candidate.findMany({
+      where: { refreshToken: { not: null } },
+    });
+    if (!candidates || candidates.length === 0) {
+      log("No candidates with refreshToken found.");
+      return;
+    }
 
-  for (const candidate of candidates) {
-    if (!candidate.accessToken && !candidate.refreshToken) continue;
+    const limit = pLimit(PARALLEL_LIMIT);
 
-    try {
-      const client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
-      client.setCredentials({ access_token: candidate.accessToken, refresh_token: candidate.refreshToken });
-      const gmail = google.gmail({ version: "v1", auth: client });
+    await Promise.all(
+      candidates.map((candidate) =>
+        limit(async () => {
+          if (deletedCandidates.has(candidate.id)) return;
 
-      let allMessages = [];
-      let nextPageToken = null;
-
-      do {
-        const listRes = await gmail.users.messages.list({
-          userId: "me",
-          q: query,
-          labelIds: ["INBOX"],
-          maxResults: 100,
-          pageToken: nextPageToken
-        });
-        if (listRes.data.messages) allMessages = allMessages.concat(listRes.data.messages);
-        nextPageToken = listRes.data.nextPageToken;
-        if (allMessages.length >= maxFetch) break;
-      } while (nextPageToken);
-
-      allMessages = allMessages.slice(0, maxFetch);
-
-      for (const m of allMessages) {
-        const exists = await prisma.message.findUnique({ where: { id: m.id } });
-        if (exists) continue;
-
-        const msg = await gmail.users.messages.get({ userId: "me", id: m.id });
-        const msgTime = parseInt(msg.data.internalDate);
-        const msgDateUTC = new Date(msgTime);
-
-        let fromHeader = "Unknown", subject = "", bodyRaw = "";
-
-        if (msg.data?.payload?.headers) {
-          for (const h of msg.data.payload.headers) {
-            if (h.name.toLowerCase() === "from") fromHeader = h.value;
-            if (h.name.toLowerCase() === "subject") subject = h.value || "";
+          // re-check candidate existence
+          const freshCandidate = await prisma.candidate.findUnique({
+            where: { id: candidate.id },
+          });
+          if (!freshCandidate) {
+            deletedCandidates.add(candidate.id);
+            return;
           }
-        }
+          if (!freshCandidate.accessToken && !freshCandidate.refreshToken)
+            return;
 
-        if (msg.data?.payload) bodyRaw = extractAllTextFromPayload(msg.data.payload);
-
-        if (!bodyRaw || bodyRaw.trim().length < 10) {
           try {
-            const rawMsg = await gmail.users.messages.get({ userId: "me", id: m.id, format: "raw" });
-            bodyRaw = Buffer.from(rawMsg.data.raw, "base64").toString("utf-8");
-          } catch (e) {}
-        }
+            const client = new google.auth.OAuth2(
+              CLIENT_ID,
+              CLIENT_SECRET,
+              REDIRECT_URI
+            );
+            client.setCredentials({
+              access_token: freshCandidate.accessToken,
+              refresh_token: freshCandidate.refreshToken,
+            });
 
-        let body = bodyRaw.replace(/[\r\n]+/g," ").replace(/\u00A0/g," ").replace(/\u200B/g,"").replace(/\u00AD/g,"").replace(/\s+/g," ").trim().toLowerCase();
-        subject = subject.toLowerCase();
+            // Try to get an access token (this can trigger refresh if refresh_token present)
+            try {
+              await client.getAccessToken();
+            } catch (e) {
+              log(
+                `getAccessToken warning for ${freshCandidate.email}:`,
+                e.message || e
+              );
+            }
 
-        if (subject.includes("thank you for your interest") && (rejectRegex.test(body))) continue;
+            const gmail = google.gmail({ version: "v1", auth: client });
 
-        const source = detectMailSource(fromHeader);
+            // List message ids matching query (paginate)
+            let allMessages = [];
+            let nextPageToken = null;
+            do {
+              const listRes = await gmail.users.messages.list({
+                userId: "me",
+                q: query,
+                labelIds: ["INBOX"],
+                maxResults: 100,
+                pageToken: nextPageToken,
+              });
+              if (listRes.data?.messages)
+                allMessages = allMessages.concat(listRes.data.messages);
+              nextPageToken = listRes.data?.nextPageToken;
+              if (allMessages.length >= maxFetch) break;
+            } while (nextPageToken);                                                                                                                                                                                                                                                                                                              
 
-        await prisma.message.create({ data: { id: m.id, candidateId: candidate.id, createdAt: msgDateUTC, from: fromHeader } });
+            if (!allMessages || allMessages.length === 0) return;
+            allMessages = allMessages.slice(0, maxFetch);
 
-        const updateTotalData = { count: { increment: 1 } };
-        if (source === "platform") updateTotalData.platformCount = { increment: 1 };
-        else updateTotalData.companyCount = { increment: 1 };
+            // Find which message ids are new
+            const ids = allMessages.map((m) => m.id);
+            const existing = await prisma.message.findMany({
+              where: { id: { in: ids } },
+              select: { id: true },
+            });
+            const existingIds = new Set(existing.map((e) => e.id));
+            const newIds = ids.filter((id) => !existingIds.has(id));
+            if (newIds.length === 0) return;
 
-        await prisma.candidate.update({ where: { id: candidate.id }, data: updateTotalData });
-      }
+            // Fetch new messages details in parallel (limited)
+            const perMsgLimit = pLimit(PER_MESSAGE_LIMIT);
+            const fetchedMsgs = await Promise.all(
+              newIds.map((mid) =>
+                perMsgLimit(async () => {
+                  try {
+                    const msgRes = await gmail.users.messages.get({
+                      userId: "me",
+                      id: mid,
+                    });
+                    const msg = msgRes.data;
+                    const msgTime = parseInt(
+                      msg.internalDate || `${Date.now()}`
+                    );
+                    const msgDateUTC = new Date(msgTime);
 
-    } catch (err) {
-      console.error(`Error processing ${candidate.email}:`, err);
-      if (err.code === 401 || (err.errors && err.errors[0]?.reason === "invalid_grant")) {
-        console.log(`Tokens invalid for candidate ${candidate.email}, nullifying...`);
-        await prisma.candidate.update({ where: { id: candidate.id }, data: { accessToken: null, refreshToken: null } });
+                    let fromHeader = "Unknown",
+                      subject = "",
+                      bodyRaw = "";
+                    if (msg.payload?.headers) {
+                      for (const h of msg.payload.headers) {
+                        if (h.name.toLowerCase() === "from")
+                          fromHeader = h.value;
+                        if (h.name.toLowerCase() === "subject")
+                          subject = h.value || "";
+                      }
+                    }
+                    if (msg.payload)
+                      bodyRaw = extractAllTextFromPayload(msg.payload);
+                    if (!bodyRaw || bodyRaw.trim().length < 10) {
+                      try {
+                        const rawMsg = await gmail.users.messages.get({
+                          userId: "me",
+                          id: mid,
+                          format: "raw",
+                        });
+                        bodyRaw = Buffer.from(
+                          rawMsg.data.raw,
+                          "base64"
+                        ).toString("utf-8");
+                      } catch (e) {}
+                    }
+
+                    const body = (bodyRaw || "")
+                      .replace(/[\r\n]+/g, " ")
+                      .replace(/\u00A0/g, " ")
+                      .replace(/\u200B/g, "")
+                      .replace(/\u00AD/g, "")
+                      .replace(/\s+/g, " ")
+                      .trim()
+                      .toLowerCase();
+                    const subj = (subject || "").toLowerCase();
+                    if (
+                      subj.includes("thank you for your interest") &&
+                      rejectRegex.test(body)
+                    ) {
+                      return null; // skip
+                    }
+
+                    return {
+                      id: mid,
+                      candidateId: freshCandidate.id,
+                      createdAt: msgDateUTC,
+                      from: fromHeader,
+                    };
+                  } catch (err) {
+                    // log but don't crash whole candidate processing
+                    log(
+                      `Failed to fetch message ${mid} for ${freshCandidate.email}:`,
+                      err.message || err
+                    );
+                    return null;
+                  }
+                })
+              )
+            );
+
+            const toInsert = fetchedMsgs.filter(Boolean);
+            if (toInsert.length === 0) return;
+
+            // Insert messages in bulk (skip duplicates)
+            // createMany does not run hooks but is fast. It supports skipDuplicates.
+            try {
+              await prisma.message.createMany({
+                data: toInsert.map((m) => ({
+                  id: m.id,
+                  candidateId: m.candidateId,
+                  createdAt: m.createdAt,
+                  from: m.from,
+                })),
+                skipDuplicates: true,
+              });
+            } catch (err) {
+              log(
+                `createMany error for candidate ${freshCandidate.id}:`,
+                err.message || err
+              );
+              // Fall back to per-row inserts if needed (rare)
+              for (const m of toInsert) {
+                try {
+                  await prisma.message.create({
+                    data: {
+                      id: m.id,
+                      candidateId: m.candidateId,
+                      createdAt: m.createdAt,
+                      from: m.from,
+                    },
+                  });
+                } catch (e) {
+                  if (e.code === "P2002") continue;
+                  if (e.code === "P2003") {
+                    deletedCandidates.add(freshCandidate.id);
+                    break;
+                  }
+                  throw e;
+                }
+              }
+            }
+
+            // After inserting messages, recompute exact counts and write into candidate row
+            await updateCandidateCounts(freshCandidate.id);
+          } catch (err) {
+            // Handle OAuth invalid_grant or expired tokens
+            log(`Error processing ${candidate.email}:`, err.message || err);
+            if (
+              err.code === 401 ||
+              (err.errors && err.errors[0]?.reason === "invalid_grant")
+            ) {
+              try {
+                await prisma.candidate.update({
+                  where: { id: candidate.id },
+                  data: { accessToken: null, refreshToken: null },
+                });
+                log(
+                  `Tokens cleared for ${candidate.email} due to invalid_grant.`
+                );
+              } catch (e) {
+                log("Error clearing tokens:", e);
+              }
+            }
+          }
+        })
+      )
+    );
+
+    // Cleanup deletedCandidates set entries that actually no longer exist
+    for (const id of Array.from(deletedCandidates)) {
+      const exists = await prisma.candidate.findUnique({ where: { id } });
+      if (!exists) {
+        deletedCandidates.delete(id);
       }
     }
+  } catch (err) {
+    log("checkMailsAndUpdateCount error:", err);
+  } finally {
+    isCronRunning = false;
+    log("Cron finished.");
   }
 }
 
-// -------------------- CRON JOB --------------------
-
+// -------------------- SCHEDULE CRON --------------------
 cron.schedule(`*/${CRON_INTERVAL} * * * *`, async () => {
-  console.log("⏰ Running mail check every", CRON_INTERVAL, "minutes");
-  try {
-    await checkMailsAndUpdateCount();
-  } catch (err) {
-    console.error("Cron job error:", err);
-  }
+  log("⏰ Running mail check every", CRON_INTERVAL, "minutes");
+  await checkMailsAndUpdateCount();
 });
-
 
 // -------------------- GET CANDIDATES --------------------
 app.get("/candidates", async (req, res) => {
   try {
+    // Fetch candidate rows (counts stored here)
     const candidates = await prisma.candidate.findMany({
-      include: { messages: true },
       orderBy: { createdAt: "desc" },
     });
 
-    const result = candidates.map((c) => {
-      // Get today's date in EST
-      const todayEST = moment().tz("America/New_York").format("YYYY-MM-DD");
+    // Build a map of today's message counts grouped by candidate (efficient single query)
+    const todayMap = await getTodayCountsGrouped();
 
-      // Calculate dailyCount
-      let dailyCount = 0;
-      c.messages.forEach((msg) => {
-        const msgDateEST = moment(msg.createdAt)
-          .tz("America/New_York")
-          .format("YYYY-MM-DD");
-        if (msgDateEST === todayEST) dailyCount++;
-      });
-
-      return {
-        id: c.id,
-        name: c.name,
-        email: c.email,
-        totalCount: c.count,
-        platformCount: c.platformCount,
-        companyCount: c.companyCount,
-        dailyCount,
-        accessToken: c.accessToken,
-      };
-    });
+    const result = candidates.map((c) => ({
+      id: c.id,
+      name: c.name,
+      email: c.email,
+      totalCount: c.count || 0,
+      platformCount: c.platformCount || 0,
+      companyCount: c.companyCount || 0,
+      dailyCount: todayMap[c.id] || 0,
+      accessToken: c.accessToken,
+    }));
 
     res.json(result);
   } catch (err) {
-    console.error("Get candidates error:", err);
+    log("Get candidates error:", err);
     res.status(500).json({ error: "Failed to fetch candidates" });
   }
 });
-
 
 // -------------------- REPORT --------------------
 app.get("/report", async (req, res) => {
   try {
     const { candidateId, from, to } = req.query;
-    if (!candidateId || !from || !to) return res.status(400).json({ error: "candidateId, from, and to required" });
+    if (!candidateId || !from || !to)
+      return res
+        .status(400)
+        .json({ error: "candidateId, from, and to required" });
 
-    const candidate = await prisma.candidate.findUnique({ where: { id: parseInt(candidateId) } });
-    if (!candidate) return res.status(404).json({ error: "Candidate not found" });
+    const candidate = await prisma.candidate.findUnique({
+      where: { id: parseInt(candidateId) },
+    });
+    if (!candidate)
+      return res.status(404).json({ error: "Candidate not found" });
 
-    const fromDateUTC = moment.tz(`${from} 00:00:00`, "YYYY-MM-DD HH:mm:ss", "America/New_York").utc().toDate();
-    const toDateUTC = moment.tz(`${to} 23:59:59`, "YYYY-MM-DD HH:mm:ss", "America/New_York").utc().toDate();
+    const fromDateUTC = moment
+      .tz(`${from} 00:00:00`, "YYYY-MM-DD HH:mm:ss", "America/New_York")
+      .utc()
+      .toDate();
+    const toDateUTC = moment
+      .tz(`${to} 23:59:59`, "YYYY-MM-DD HH:mm:ss", "America/New_York")
+      .utc()
+      .toDate();
 
     const messages = await prisma.message.findMany({
-      where: { candidateId: candidate.id, createdAt: { gte: fromDateUTC, lte: toDateUTC } },
-      orderBy: { createdAt: "asc" }
+      where: {
+        candidateId: candidate.id,
+        createdAt: { gte: fromDateUTC, lte: toDateUTC },
+      },
+      orderBy: { createdAt: "asc" },
     });
 
     const dailyMap = {};
     messages.forEach((msg) => {
-      const estDate = moment(msg.createdAt).tz("America/New_York").format("YYYY-MM-DD");
-      if (!dailyMap[estDate]) dailyMap[estDate] = { count: 0, platformCount: 0, companyCount: 0 };
+      const estDate = moment(msg.createdAt)
+        .tz("America/New_York")
+        .format("YYYY-MM-DD");
+      if (!dailyMap[estDate])
+        dailyMap[estDate] = { count: 0, platformCount: 0, companyCount: 0 };
       dailyMap[estDate].count++;
       const source = detectMailSource(msg.from);
       if (source === "platform") dailyMap[estDate].platformCount++;
@@ -402,30 +685,40 @@ app.get("/report", async (req, res) => {
       const day = curr.day();
       if (day !== 0 && day !== 6) {
         const dateStr = curr.format("YYYY-MM-DD");
-        allDates.push({ cycleStart: dateStr, count: dailyMap[dateStr]?.count || 0, platformCount: dailyMap[dateStr]?.platformCount || 0, companyCount: dailyMap[dateStr]?.companyCount || 0 });
+        allDates.push({
+          cycleStart: dateStr,
+          count: dailyMap[dateStr]?.count || 0,
+          platformCount: dailyMap[dateStr]?.platformCount || 0,
+          companyCount: dailyMap[dateStr]?.companyCount || 0,
+        });
       }
       curr.add(1, "day");
     }
 
     const totalCount = allDates.reduce((sum, d) => sum + d.count, 0);
-    const platformCountTotal = allDates.reduce((sum, d) => sum + d.platformCount, 0);
-    const companyCountTotal = allDates.reduce((sum, d) => sum + d.companyCount, 0);
+    const platformCountTotal = allDates.reduce(
+      (sum, d) => sum + d.platformCount,
+      0
+    );
+    const companyCountTotal = allDates.reduce(
+      (sum, d) => sum + d.companyCount,
+      0
+    );
 
-    res.json({ totalCount, platformCountTotal, companyCountTotal, dailyCounts: allDates });
-  } catch (err) { console.error("Report fetch error:", err); res.status(500).json({ error: "Failed to fetch report" }); }
+    res.json({
+      totalCount,
+      platformCountTotal,
+      companyCountTotal,
+      dailyCounts: allDates,
+    });
+  } catch (err) {
+    log("Report fetch error:", err);
+    res.status(500).json({ error: "Failed to fetch report" });
+  }
 });
 
 // -------------------- START SERVER --------------------
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-
-
-
-
-
-
-
-
-
+app.listen(PORT, () => log(`Server running on port ${PORT}`));
 
 // require("dotenv").config();
 // const express = require("express");
@@ -448,6 +741,8 @@ app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 //   process.env.REDIRECT_URI || "http://localhost:5000/oauth2callback";
 // const CRON_INTERVAL = process.env.CRON_INTERVAL || 2; // in minutes
 
+// let isCronRunning = false; // prevent cron overlap
+
 // // -------------------- HEALTH CHECK --------------------
 // app.get("/", (req, res) => res.send({ status: "ok" }));
 
@@ -456,13 +751,13 @@ app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 //   const { username, password } = req.body;
 //   try {
 //     const admin = await prisma.admin.findFirst();
-
 //     if (!admin)
-//       return res.status(404).json({ error: "No admin found. Please set credentials first via Forgot Password." });
-
+//       return res.status(404).json({
+//         error:
+//           "No admin found. Please set credentials first via Forgot Password.",
+//       });
 //     if (admin.username !== username || admin.password !== password)
 //       return res.status(401).json({ error: "Invalid username or password" });
-
 //     const token = jwt.sign({ username }, "supersecretkey", { expiresIn: "1h" });
 //     res.json({ token, username });
 //   } catch (err) {
@@ -475,7 +770,6 @@ app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 // app.post("/forgot-password-question", async (req, res) => {
 //   try {
 //     let admin = await prisma.admin.findFirst();
-
 //     if (!admin) {
 //       admin = await prisma.admin.create({
 //         data: {
@@ -486,7 +780,571 @@ app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 //         },
 //       });
 //     }
+//     res.json({ question: admin.question });
+//   } catch (err) {
+//     console.error("Forgot question error:", err);
+//     res.status(500).json({ error: "Failed to get question" });
+//   }
+// });
 
+// // -------------------- VERIFY ANSWER --------------------
+// app.post("/verify-answer", async (req, res) => {
+//   const { answer } = req.body;
+//   try {
+//     const admin = await prisma.admin.findFirst();
+//     if (!admin) return res.status(404).json({ error: "No admin found" });
+
+//     const provided = (answer || "").trim().toLowerCase();
+//     const stored = (admin.answer || "").trim().toLowerCase();
+
+//     if (provided !== stored)
+//       return res.status(401).json({ error: "Incorrect answer" });
+//     res.json({ success: true });
+//   } catch (err) {
+//     console.error("Verify answer error:", err);
+//     res.status(500).json({ error: "Verification failed" });
+//   }
+// });
+
+// // -------------------- RESET CREDENTIALS --------------------
+// app.post("/reset-credentials", async (req, res) => {
+//   const { newUsername, newPassword, confirmPassword } = req.body;
+//   if (newPassword !== confirmPassword)
+//     return res.status(400).json({ error: "Passwords do not match" });
+
+//   try {
+//     let admin = await prisma.admin.findFirst();
+//     if (!admin) {
+//       admin = await prisma.admin.create({
+//         data: {
+//           username: newUsername,
+//           password: newPassword,
+//           question: "What happened on your birthday?",
+//           answer: "default",
+//         },
+//       });
+//     } else {
+//       await prisma.admin.update({
+//         where: { id: admin.id },
+//         data: { username: newUsername, password: newPassword },
+//       });
+//     }
+//     res.json({ success: true, message: "Credentials updated successfully" });
+//   } catch (err) {
+//     console.error("Reset credentials error:", err);
+//     res.status(500).json({ error: "Failed to update credentials" });
+//   }
+// });
+
+// // -------------------- ADD CANDIDATE --------------------
+// app.post("/candidates", async (req, res) => {
+//   const { name, email } = req.body;
+//   if (!name || !email)
+//     return res.status(400).json({ error: "name and email required" });
+
+//   try {
+//     const newCandidate = await prisma.candidate.create({
+//       data: { name, email, count: 0, platformCount: 0, companyCount: 0 },
+//     });
+//     res.status(201).json(newCandidate);
+//   } catch (err) {
+//     console.error("Error adding candidate:", err.message || err);
+//     if (err.code === "P2002")
+//       return res
+//         .status(409)
+//         .json({ error: "Candidate with this email already exists" });
+//     res.status(500).json({ error: "Failed to add candidate" });
+//   }
+// });
+
+// // -------------------- DELETE CANDIDATE --------------------
+// app.delete("/candidates/:id", async (req, res) => {
+//   try {
+//     const { id } = req.params;
+//     await prisma.message.deleteMany({ where: { candidateId: parseInt(id) } });
+//     await prisma.candidate.delete({ where: { id: parseInt(id) } });
+//     res.json({ success: true, message: "Candidate deleted" });
+//   } catch (err) {
+//     console.error("Delete candidate error:", err.message || err);
+//     res.status(500).json({ error: "Failed to delete candidate" });
+//   }
+// });
+
+// // -------------------- AUTH --------------------
+// app.get("/auth/:candidateId", async (req, res) => {
+//   const { candidateId } = req.params;
+//   const oAuth2Client = new google.auth.OAuth2(
+//     CLIENT_ID,
+//     CLIENT_SECRET,
+//     REDIRECT_URI
+//   );
+//   const authUrl = oAuth2Client.generateAuthUrl({
+//     access_type: "offline",
+//     scope: ["https://www.googleapis.com/auth/gmail.readonly"],
+//     state: candidateId,
+//     prompt: "consent",
+//   });
+//   res.redirect(authUrl);
+// });
+
+// app.get("/oauth2callback", async (req, res) => {
+//   try {
+//     const code = req.query.code;
+//     const candidateId = req.query.state;
+//     if (!code || !candidateId)
+//       return res.status(400).send("Missing code or state.");
+
+//     const oAuth2Client = new google.auth.OAuth2(
+//       CLIENT_ID,
+//       CLIENT_SECRET,
+//       REDIRECT_URI
+//     );
+//     const { tokens } = await oAuth2Client.getToken(code);
+//     oAuth2Client.setCredentials(tokens);
+
+//     const profile = await google
+//       .gmail({ version: "v1", auth: oAuth2Client })
+//       .users.getProfile({ userId: "me" });
+//     const googleEmail = profile?.data?.emailAddress || "";
+
+//     const candidate = await prisma.candidate.findUnique({
+//       where: { id: parseInt(candidateId) },
+//     });
+//     if (!candidate) return res.status(404).send("Candidate not found.");
+//     if (
+//       candidate.email.toLowerCase().trim() !== googleEmail.toLowerCase().trim()
+//     )
+//       return res
+//         .status(400)
+//         .send(
+//           `Authorized Google account (${googleEmail}) does not match candidate email (${candidate.email}).`
+//         );
+
+//     await prisma.candidate.update({
+//       where: { id: candidate.id },
+//       data: {
+//         accessToken: tokens.access_token || null,
+//         refreshToken: tokens.refresh_token || null,
+//       },
+//     });
+
+//     res.send("✅ OAuth Success — account verified and tokens saved.");
+//   } catch (err) {
+//     console.error("OAuth callback error:", err.message || err);
+//     res.status(500).send("OAuth failed");
+//   }
+// });
+
+// // -------------------- DETECT MAIL SOURCE --------------------
+// function detectMailSource(fromEmail) {
+//   if (!fromEmail || fromEmail === "Unknown") return "company";
+//   const email = fromEmail.toLowerCase();
+//   const platforms = [
+//     "linkedin.com",
+//     "indeed.com",
+//     "glassdoor.com",
+//     "simplyhired.com",
+//     "dice.com",
+//     "monster.com",
+//     "careerbuilder.com",
+//     "apexsystems.com",
+//     "ziprecruiter.com",
+//     "randstad.com",
+//     "roberthalf.com",
+//     "brooksource.com",
+//     "insightglobal.com",
+//     "teksystems.com",
+//     "kforce.com",
+//     "levels.fyi",
+//     "talenty.io",
+//     "jobright.com",
+//     "swooped.com",
+//     "simplify.com",
+//     "builtin.com",
+//     "workable.com",
+//   ];
+//   return platforms.some((domain) => email.includes(domain))
+//     ? "platform"
+//     : "company";
+// }
+
+// // -------------------- EXTRACT TEXT --------------------
+// function extractAllTextFromPayload(payload) {
+//   let acc = "";
+//   function walk(part) {
+//     if (!part) return;
+//     if (part.body && part.body.data) {
+//       try {
+//         acc += Buffer.from(part.body.data, "base64").toString("utf-8") + " ";
+//       } catch (e) {}
+//     }
+//     if (part.parts && Array.isArray(part.parts)) part.parts.forEach(walk);
+//   }
+//   walk(payload);
+//   acc = acc.replace(/<[^>]+>/g, " ");
+//   acc = acc.replace(/&nbsp;|&amp;|&lt;|&gt;|&quot;|&#39;/g, " ");
+//   return acc;
+// }
+
+// // -------------------- CHECK MAILS & UPDATE COUNT --------------------
+// async function checkMailsAndUpdateCount() {
+//   if (isCronRunning) return; // prevent overlap
+//   isCronRunning = true;
+//   const subjects = [
+//     "Thank you for applying",
+//     "Thank you for applying!",
+//     "Thanks for applying",
+//     "We received your",
+//     "Application Received",
+//     "Your application for the position",
+//     "Your recent application for the position",
+//     "we've received",
+//     "We have successfully received your application",
+//     "Submitted:",
+//     "we have received",
+//     "submitted",
+//     "your application was sent",
+//     "Submission",
+//     "Thank you for your application",
+//     "Thank you for your application!",
+//     "Thank you for the application",
+//     "Application was received",
+//     "Thanks for your application",
+//     "Thanks for completing your application",
+//     "has been received",
+//     "Indeed Application:",
+//     "We received your application",
+//     "we received your job application",
+//     "we received job application",
+//     "Application Acknowledgement",
+//     "Thank you for your interest",
+//     "Thank you for your job application",
+//     "your resume was received",
+//     "Thank you for submitting your application",
+//   ];
+//   const query = "subject:(" + subjects.map((s) => `"${s}"`).join(" OR ") + ")";
+//   const maxFetch = 100000;
+//   const rejectRegex =
+//     /(not|won't|unable|unfortunate|unfortunately| other candidates|with other candidates|regret to inform|declined|position has been filled|no longer under consideration|another candidate)/i;
+
+//   try {
+//     const candidates = await prisma.candidate.findMany({
+//       where: { refreshToken: { not: null } },
+//     });
+//     if (!candidates || candidates.length === 0) return;
+
+//     for (const candidate of candidates) {
+//       if (!candidate.accessToken && !candidate.refreshToken) continue;
+//       try {
+//         const client = new google.auth.OAuth2(
+//           CLIENT_ID,
+//           CLIENT_SECRET,
+//           REDIRECT_URI
+//         );
+//         client.setCredentials({
+//           access_token: candidate.accessToken,
+//           refresh_token: candidate.refreshToken,
+//         });
+//         const gmail = google.gmail({ version: "v1", auth: client });
+
+//         let allMessages = [];
+//         let nextPageToken = null;
+
+//         do {
+//           const listRes = await gmail.users.messages.list({
+//             userId: "me",
+//             q: query,
+//             labelIds: ["INBOX"],
+//             maxResults: 100,
+//             pageToken: nextPageToken,
+//           });
+//           if (listRes.data.messages)
+//             allMessages = allMessages.concat(listRes.data.messages);
+//           nextPageToken = listRes.data.nextPageToken;
+//           if (allMessages.length >= maxFetch) break;
+//         } while (nextPageToken);
+
+//         allMessages = allMessages.slice(0, maxFetch);
+
+//         for (const m of allMessages) {
+//           const exists = await prisma.message.findUnique({
+//             where: { id: m.id },
+//           });
+//           if (exists) continue;
+
+//           const msg = await gmail.users.messages.get({
+//             userId: "me",
+//             id: m.id,
+//           });
+//           const msgTime = parseInt(msg.data.internalDate);
+//           const msgDateUTC = new Date(msgTime);
+
+//           let fromHeader = "Unknown",
+//             subject = "",
+//             bodyRaw = "";
+
+//           if (msg.data?.payload?.headers) {
+//             for (const h of msg.data.payload.headers) {
+//               if (h.name.toLowerCase() === "from") fromHeader = h.value;
+//               if (h.name.toLowerCase() === "subject") subject = h.value || "";
+//             }
+//           }
+
+//           if (msg.data?.payload)
+//             bodyRaw = extractAllTextFromPayload(msg.data.payload);
+
+//           if (!bodyRaw || bodyRaw.trim().length < 10) {
+//             try {
+//               const rawMsg = await gmail.users.messages.get({
+//                 userId: "me",
+//                 id: m.id,
+//                 format: "raw",
+//               });
+//               bodyRaw = Buffer.from(rawMsg.data.raw, "base64").toString(
+//                 "utf-8"
+//               );
+//             } catch (e) {}
+//           }
+
+//           let body = bodyRaw
+//             .replace(/[\r\n]+/g, " ")
+//             .replace(/\u00A0/g, " ")
+//             .replace(/\u200B/g, "")
+//             .replace(/\u00AD/g, "")
+//             .replace(/\s+/g, " ")
+//             .trim()
+//             .toLowerCase();
+//           subject = subject.toLowerCase();
+
+//           if (
+//             subject.includes("thank you for your interest") &&
+//             rejectRegex.test(body)
+//           )
+//             continue;
+
+//           const source = detectMailSource(fromHeader);
+
+//           await prisma.message.create({
+//             data: {
+//               id: m.id,
+//               candidateId: candidate.id,
+//               createdAt: msgDateUTC,
+//               from: fromHeader,
+//             },
+//           });
+
+//           const updateTotalData = { count: { increment: 1 } };
+//           if (source === "platform")
+//             updateTotalData.platformCount = { increment: 1 };
+//           else updateTotalData.companyCount = { increment: 1 };
+
+//           await prisma.candidate.update({
+//             where: { id: candidate.id },
+//             data: updateTotalData,
+//           });
+//         }
+//       } catch (err) {
+//         console.error(`Error processing ${candidate.email}:`, err);
+//         if (
+//           err.code === 401 ||
+//           (err.errors && err.errors[0]?.reason === "invalid_grant")
+//         ) {
+//           await prisma.candidate.update({
+//             where: { id: candidate.id },
+//             data: { accessToken: null, refreshToken: null },
+//           });
+//         }
+//       }
+//     }
+//   } catch (err) {
+//     console.error("checkMailsAndUpdateCount error:", err);
+//   } finally {
+//     isCronRunning = false;
+//   }
+// }
+
+// // -------------------- CRON JOB --------------------
+// cron.schedule(`*/${CRON_INTERVAL} * * * *`, async () => {
+//   console.log("⏰ Running mail check every", CRON_INTERVAL, "minutes");
+//   await checkMailsAndUpdateCount();
+// });
+
+// // -------------------- GET CANDIDATES --------------------
+// app.get("/candidates", async (req, res) => {
+//   try {
+//     const candidates = await prisma.candidate.findMany({
+//       include: { messages: true },
+//       orderBy: { createdAt: "desc" },
+//     });
+
+//     const result = candidates.map((c) => {
+//       const todayEST = moment().tz("America/New_York").format("YYYY-MM-DD");
+//       let dailyCount = 0;
+//       c.messages.forEach((msg) => {
+//         const msgDateEST = moment(msg.createdAt)
+//           .tz("America/New_York")
+//           .format("YYYY-MM-DD");
+//         if (msgDateEST === todayEST) dailyCount++;
+//       });
+//       return {
+//         id: c.id,
+//         name: c.name,
+//         email: c.email,
+//         totalCount: c.count,
+//         platformCount: c.platformCount,
+//         companyCount: c.companyCount,
+//         dailyCount,
+//         accessToken: c.accessToken,
+//       };
+//     });
+
+//     res.json(result);
+//   } catch (err) {
+//     console.error("Get candidates error:", err);
+//     res.status(500).json({ error: "Failed to fetch candidates" });
+//   }
+// });
+
+// // -------------------- REPORT --------------------
+// app.get("/report", async (req, res) => {
+//   try {
+//     const { candidateId, from, to } = req.query;
+//     if (!candidateId || !from || !to)
+//       return res
+//         .status(400)
+//         .json({ error: "candidateId, from, and to required" });
+
+//     const candidate = await prisma.candidate.findUnique({
+//       where: { id: parseInt(candidateId) },
+//     });
+//     if (!candidate)
+//       return res.status(404).json({ error: "Candidate not found" });
+
+//     const fromDateUTC = moment
+//       .tz(`${from} 00:00:00`, "YYYY-MM-DD HH:mm:ss", "America/New_York")
+//       .utc()
+//       .toDate();
+//     const toDateUTC = moment
+//       .tz(`${to} 23:59:59`, "YYYY-MM-DD HH:mm:ss", "America/New_York")
+//       .utc()
+//       .toDate();
+
+//     const messages = await prisma.message.findMany({
+//       where: {
+//         candidateId: candidate.id,
+//         createdAt: { gte: fromDateUTC, lte: toDateUTC },
+//       },
+//       orderBy: { createdAt: "asc" },
+//     });
+
+//     const dailyMap = {};
+//     messages.forEach((msg) => {
+//       const estDate = moment(msg.createdAt)
+//         .tz("America/New_York")
+//         .format("YYYY-MM-DD");
+//       if (!dailyMap[estDate])
+//         dailyMap[estDate] = { count: 0, platformCount: 0, companyCount: 0 };
+//       dailyMap[estDate].count++;
+//       const source = detectMailSource(msg.from);
+//       if (source === "platform") dailyMap[estDate].platformCount++;
+//       else dailyMap[estDate].companyCount++;
+//     });
+
+//     const allDates = [];
+//     let curr = moment.tz(from, "America/New_York");
+//     const end = moment.tz(to, "America/New_York");
+//     while (curr.isSameOrBefore(end)) {
+//       const day = curr.day();
+//       if (day !== 0 && day !== 6) {
+//         const dateStr = curr.format("YYYY-MM-DD");
+//         allDates.push({
+//           cycleStart: dateStr,
+//           count: dailyMap[dateStr]?.count || 0,
+//           platformCount: dailyMap[dateStr]?.platformCount || 0,
+//           companyCount: dailyMap[dateStr]?.companyCount || 0,
+//         });
+//       }
+//       curr.add(1, "day");
+//     }
+
+//     const totalCount = allDates.reduce((sum, d) => sum + d.count, 0);
+//     const platformCountTotal = allDates.reduce(
+//       (sum, d) => sum + d.platformCount,
+//       0
+//     );
+//     const companyCountTotal = allDates.reduce(
+//       (sum, d) => sum + d.companyCount,
+//       0
+//     );
+
+//     res.json({
+//       totalCount,
+//       platformCountTotal,
+//       companyCountTotal,
+//       dailyCounts: allDates,
+//     });
+//   } catch (err) {
+//     console.error("Report fetch error:", err);
+//     res.status(500).json({ error: "Failed to fetch report" });
+//   }
+// });
+
+// // -------------------- START SERVER --------------------
+// app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
+// require("dotenv").config();
+// const express = require("express");
+// const cors = require("cors");
+// const { PrismaClient } = require("@prisma/client");
+// const { google } = require("googleapis");
+// const cron = require("node-cron");
+// const jwt = require("jsonwebtoken");
+// const moment = require("moment-timezone");
+
+// const prisma = new PrismaClient();
+// const app = express();
+// app.use(cors());
+// app.use(express.json());
+
+// const PORT = process.env.PORT || 5000;
+// const CLIENT_ID = process.env.CLIENT_ID || "";
+// const CLIENT_SECRET = process.env.CLIENT_SECRET || "";
+// const REDIRECT_URI = process.env.REDIRECT_URI || "http://localhost:5000/oauth2callback";
+// const CRON_INTERVAL = process.env.CRON_INTERVAL || 2; // in minutes
+
+// // -------------------- HEALTH CHECK --------------------
+// app.get("/", (req, res) => res.send({ status: "ok" }));
+
+// // -------------------- LOGIN --------------------
+// app.post("/login", async (req, res) => {
+//   const { username, password } = req.body;
+//   try {
+//     const admin = await prisma.admin.findFirst();
+//     if (!admin) return res.status(404).json({ error: "No admin found. Please set credentials first via Forgot Password." });
+//     if (admin.username !== username || admin.password !== password)
+//       return res.status(401).json({ error: "Invalid username or password" });
+//     const token = jwt.sign({ username }, "supersecretkey", { expiresIn: "1h" });
+//     res.json({ token, username });
+//   } catch (err) {
+//     console.error("Login error:", err);
+//     res.status(500).json({ error: "Login failed" });
+//   }
+// });
+
+// // -------------------- FORGOT PASSWORD (get question) --------------------
+// app.post("/forgot-password-question", async (req, res) => {
+//   try {
+//     let admin = await prisma.admin.findFirst();
+//     if (!admin) {
+//       admin = await prisma.admin.create({
+//         data: {
+//           username: "",
+//           password: "",
+//           question: "What happened on your birthday?",
+//           answer: "default",
+//         },
+//       });
+//     }
 //     res.json({ question: admin.question });
 //   } catch (err) {
 //     console.error("Forgot question error:", err);
@@ -505,7 +1363,6 @@ app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 //     const stored = (admin.answer || "").trim().toLowerCase();
 
 //     if (provided !== stored) return res.status(401).json({ error: "Incorrect answer" });
-
 //     res.json({ success: true });
 //   } catch (err) {
 //     console.error("Verify answer error:", err);
@@ -521,7 +1378,6 @@ app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
 //   try {
 //     let admin = await prisma.admin.findFirst();
-
 //     if (!admin) {
 //       admin = await prisma.admin.create({
 //         data: {
@@ -537,7 +1393,6 @@ app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 //         data: { username: newUsername, password: newPassword },
 //       });
 //     }
-
 //     res.json({ success: true, message: "Credentials updated successfully" });
 //   } catch (err) {
 //     console.error("Reset credentials error:", err);
@@ -559,9 +1414,7 @@ app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 //   } catch (err) {
 //     console.error("Error adding candidate:", err.message || err);
 //     if (err.code === "P2002")
-//       return res
-//         .status(409)
-//         .json({ error: "Candidate with this email already exists" });
+//       return res.status(409).json({ error: "Candidate with this email already exists" });
 //     res.status(500).json({ error: "Failed to add candidate" });
 //   }
 // });
@@ -582,11 +1435,7 @@ app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 // // -------------------- AUTH --------------------
 // app.get("/auth/:candidateId", async (req, res) => {
 //   const { candidateId } = req.params;
-//   const oAuth2Client = new google.auth.OAuth2(
-//     CLIENT_ID,
-//     CLIENT_SECRET,
-//     REDIRECT_URI
-//   );
+//   const oAuth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
 //   const authUrl = oAuth2Client.generateAuthUrl({
 //     access_type: "offline",
 //     scope: ["https://www.googleapis.com/auth/gmail.readonly"],
@@ -603,31 +1452,17 @@ app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 //     if (!code || !candidateId)
 //       return res.status(400).send("Missing code or state.");
 
-//     const oAuth2Client = new google.auth.OAuth2(
-//       CLIENT_ID,
-//       CLIENT_SECRET,
-//       REDIRECT_URI
-//     );
+//     const oAuth2Client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
 //     const { tokens } = await oAuth2Client.getToken(code);
 //     oAuth2Client.setCredentials(tokens);
 
-//     const profile = await google
-//       .gmail({ version: "v1", auth: oAuth2Client })
-//       .users.getProfile({ userId: "me" });
+//     const profile = await google.gmail({ version: "v1", auth: oAuth2Client }).users.getProfile({ userId: "me" });
 //     const googleEmail = profile?.data?.emailAddress || "";
 
-//     const candidate = await prisma.candidate.findUnique({
-//       where: { id: parseInt(candidateId) },
-//     });
+//     const candidate = await prisma.candidate.findUnique({ where: { id: parseInt(candidateId) } });
 //     if (!candidate) return res.status(404).send("Candidate not found.");
-//     if (
-//       candidate.email.toLowerCase().trim() !== googleEmail.toLowerCase().trim()
-//     )
-//       return res
-//         .status(400)
-//         .send(
-//           `Authorized Google account (${googleEmail}) does not match candidate email (${candidate.email}).`
-//         );
+//     if (candidate.email.toLowerCase().trim() !== googleEmail.toLowerCase().trim())
+//       return res.status(400).send(`Authorized Google account (${googleEmail}) does not match candidate email (${candidate.email}).`);
 
 //     await prisma.candidate.update({
 //       where: { id: candidate.id },
@@ -647,36 +1482,15 @@ app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 // // -------------------- DETECT MAIL SOURCE --------------------
 // function detectMailSource(fromEmail) {
 //   if (!fromEmail || fromEmail === "Unknown") return "company";
-
 //   const email = fromEmail.toLowerCase();
 //   const platforms = [
-//     "linkedin.com",
-//     "indeed.com",
-//     "glassdoor.com",
-//     "simplyhired.com",
-//     "dice.com",
-//     "monster.com",
-//     "careerbuilder.com",
-//     "apexsystems.com",
-//     "ziprecruiter.com",
-//     "randstad.com",
-//     "roberthalf.com",
-//     "brooksource.com",
-//     "insightglobal.com",
-//     "teksystems.com",
-//     "kforce.com",
-//     "levels.fyi",
-//     "talenty.io",
-//     "jobright.com",
-//     "swooped.com",
-//     "simplify.com",
-//     "builtin.com",
-//     "workable.com",
+//     "linkedin.com","indeed.com","glassdoor.com","simplyhired.com","dice.com",
+//     "monster.com","careerbuilder.com","apexsystems.com","ziprecruiter.com",
+//     "randstad.com","roberthalf.com","brooksource.com","insightglobal.com",
+//     "teksystems.com","kforce.com","levels.fyi","talenty.io","jobright.com",
+//     "swooped.com","simplify.com","builtin.com","workable.com"
 //   ];
-
-//   return platforms.some((domain) => email.includes(domain))
-//     ? "platform"
-//     : "company";
+//   return platforms.some(domain => email.includes(domain)) ? "platform" : "company";
 // }
 
 // // -------------------- EXTRACT TEXT --------------------
@@ -685,13 +1499,9 @@ app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 //   function walk(part) {
 //     if (!part) return;
 //     if (part.body && part.body.data) {
-//       try {
-//         acc += Buffer.from(part.body.data, "base64").toString("utf-8") + " ";
-//       } catch (e) {}
+//       try { acc += Buffer.from(part.body.data, "base64").toString("utf-8") + " "; } catch(e){}
 //     }
-//     if (part.parts && Array.isArray(part.parts)) {
-//       part.parts.forEach(walk);
-//     }
+//     if (part.parts && Array.isArray(part.parts)) part.parts.forEach(walk);
 //   }
 //   walk(payload);
 //   acc = acc.replace(/<[^>]+>/g, " ");
@@ -702,47 +1512,23 @@ app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 // // -------------------- CHECK MAILS & UPDATE COUNT --------------------
 // async function checkMailsAndUpdateCount() {
 //   const subjects = [
-//     "Thank you for applying",
-//     "Thank you for applying!",
-//     "Thanks for applying",
-//     "We received your",
-//     "Application Received",
-//     "Your application for the position",
-//     "Your recent application for the position",
-//     "we've received",
-//     "We have successfully received your application",
-//     "Submitted:",
-//     "we have received",
-//     "submitted",
-//     "your application was sent",
-//     "Submission",
-//     "Thank you for your application",
-//     "Thank you for your application!",
-//     "Thank you for the application",
-//     "Application was received",
-//     "Thanks for your application",
-//     "Thanks for completing your application",
-//     "has been received",
-//     "Indeed Application:",
-//     "We received your application",
-//     "we received your job application",
-//     "we received job application",
-//     "Application Acknowledgement",
-//     "Thank you for your interest",
-//     "Thank you for your job application",
-//     "your resume was received",
-//     "Thank you for submitting your application",
+//     "Thank you for applying","Thank you for applying!","Thanks for applying",
+//     "We received your","Application Received","Your application for the position",
+//     "Your recent application for the position","we've received","We have successfully received your application",
+//     "Submitted:","we have received","submitted","your application was sent",
+//     "Submission","Thank you for your application","Thank you for your application!",
+//     "Thank you for the application","Application was received","Thanks for your application",
+//     "Thanks for completing your application","has been received","Indeed Application:",
+//     "We received your application","we received your job application",
+//     "we received job application","Application Acknowledgement","Thank you for your interest",
+//     "Thank you for your job application","your resume was received","Thank you for submitting your application"
 //   ];
-
-//   const query = "subject:(" + subjects.map((s) => `"${s}"`).join(" OR ") + ")";
+//   const query = "subject:(" + subjects.map(s => `"${s}"`).join(" OR ") + ")";
 //   const maxFetch = 100000;
-
 //   const rejectRegex = /(not|won't|unable|unfortunate|unfortunately|unfortunately,|pursue other candidates|with other candidates|regret to inform|declined|position has been filled|no longer under consideration|unfortunate|another candidate)/i;
-//   const forwardRegex = /forwarded message|-----original message-----/i;
+//   // const forwardRegex = /forwarded message|-----original message-----/i;
 
-//   const candidates = await prisma.candidate.findMany({
-//     where: { refreshToken: { not: null } },
-//   });
+//   const candidates = await prisma.candidate.findMany({ where: { refreshToken: { not: null } } });
 //   if (!candidates || candidates.length === 0) return;
 
 //   for (const candidate of candidates) {
@@ -750,10 +1536,7 @@ app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
 //     try {
 //       const client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
-//       client.setCredentials({
-//         access_token: candidate.accessToken,
-//         refresh_token: candidate.refreshToken,
-//       });
+//       client.setCredentials({ access_token: candidate.accessToken, refresh_token: candidate.refreshToken });
 //       const gmail = google.gmail({ version: "v1", auth: client });
 
 //       let allMessages = [];
@@ -765,7 +1548,7 @@ app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 //           q: query,
 //           labelIds: ["INBOX"],
 //           maxResults: 100,
-//           pageToken: nextPageToken,
+//           pageToken: nextPageToken
 //         });
 //         if (listRes.data.messages) allMessages = allMessages.concat(listRes.data.messages);
 //         nextPageToken = listRes.data.nextPageToken;
@@ -782,9 +1565,7 @@ app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 //         const msgTime = parseInt(msg.data.internalDate);
 //         const msgDateUTC = new Date(msgTime);
 
-//         let fromHeader = "Unknown";
-//         let subject = "";
-//         let bodyRaw = "";
+//         let fromHeader = "Unknown", subject = "", bodyRaw = "";
 
 //         if (msg.data?.payload?.headers) {
 //           for (const h of msg.data.payload.headers) {
@@ -793,109 +1574,51 @@ app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 //           }
 //         }
 
-//         if (msg.data?.payload) {
-//           bodyRaw = extractAllTextFromPayload(msg.data.payload);
-//         }
+//         if (msg.data?.payload) bodyRaw = extractAllTextFromPayload(msg.data.payload);
 
 //         if (!bodyRaw || bodyRaw.trim().length < 10) {
 //           try {
-//             const rawMsg = await gmail.users.messages.get({
-//               userId: "me",
-//               id: m.id,
-//               format: "raw",
-//             });
+//             const rawMsg = await gmail.users.messages.get({ userId: "me", id: m.id, format: "raw" });
 //             bodyRaw = Buffer.from(rawMsg.data.raw, "base64").toString("utf-8");
 //           } catch (e) {}
 //         }
 
-//         let body = bodyRaw
-//           .replace(/[\r\n]+/g, " ")
-//           .replace(/\u00A0/g, " ")
-//           .replace(/\u200B/g, "")
-//           .replace(/\u00AD/g, "")
-//           .replace(/\s+/g, " ")
-//           .trim()
-//           .toLowerCase();
+//         let body = bodyRaw.replace(/[\r\n]+/g," ").replace(/\u00A0/g," ").replace(/\u200B/g,"").replace(/\u00AD/g,"").replace(/\s+/g," ").trim().toLowerCase();
 //         subject = subject.toLowerCase();
 
-//         if (
-//           subject.includes("thank you for your interest") &&
-//           (rejectRegex.test(body) || forwardRegex.test(body))
-//         ) {
-//           continue;
-//         }
+//         if (subject.includes("thank you for your interest") && (rejectRegex.test(body))) continue;
 
 //         const source = detectMailSource(fromHeader);
 
-//         await prisma.message.create({
-//           data: {
-//             id: m.id,
-//             candidateId: candidate.id,
-//             createdAt: msgDateUTC,
-//             from: fromHeader,
-//           },
-//         });
+//         await prisma.message.create({ data: { id: m.id, candidateId: candidate.id, createdAt: msgDateUTC, from: fromHeader } });
 
 //         const updateTotalData = { count: { increment: 1 } };
 //         if (source === "platform") updateTotalData.platformCount = { increment: 1 };
 //         else updateTotalData.companyCount = { increment: 1 };
 
-//         await prisma.candidate.update({
-//           where: { id: candidate.id },
-//           data: updateTotalData,
-//         });
+//         await prisma.candidate.update({ where: { id: candidate.id }, data: updateTotalData });
 //       }
+
 //     } catch (err) {
 //       console.error(`Error processing ${candidate.email}:`, err);
-
-//       // -------------------- TOKEN EXPIRED / INVALID --------------------
-//       if (
-//         err.code === 401 || // unauthorized                                                                                                                                                             
-//         (err.errors && err.errors[0]?.reason === "invalid_grant")
-//       ) {
+//       if (err.code === 401 || (err.errors && err.errors[0]?.reason === "invalid_grant")) {
 //         console.log(`Tokens invalid for candidate ${candidate.email}, nullifying...`);
-//         await prisma.candidate.update({
-//           where: { id: candidate.id },
-//           data: {
-//             accessToken: null,
-//             refreshToken: null,
-//           },
-//         });
+//         await prisma.candidate.update({ where: { id: candidate.id }, data: { accessToken: null, refreshToken: null } });
 //       }
 //     }
 //   }
 // }
 
-
 // // -------------------- CRON JOB --------------------
 
-// let isRunning = false; // flag to prevent overlapping
-
 // cron.schedule(`*/${CRON_INTERVAL} * * * *`, async () => {
-//   if (isRunning) {
-//     console.log("⏱️ Previous cron job still running. Skipping this run...");
-//     return;
-//   }
-
 //   console.log("⏰ Running mail check every", CRON_INTERVAL, "minutes");
-//   isRunning = true;
-
 //   try {
 //     await checkMailsAndUpdateCount();
 //   } catch (err) {
 //     console.error("Cron job error:", err);
-//   } finally {
-//     isRunning = false;
 //   }
 // });
-
-
-
-
-// // cron.schedule(`*/${CRON_INTERVAL} * * * *`, () => {
-// //   console.log("⏰ Running mail check every", CRON_INTERVAL, "minutes");
-// //   checkMailsAndUpdateCount();
-// // });
 
 // // -------------------- GET CANDIDATES --------------------
 // app.get("/candidates", async (req, res) => {
@@ -906,20 +1629,16 @@ app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 //     });
 
 //     const result = candidates.map((c) => {
-//       let dailyCount = 0;
-//       const todayEST = new Date().toLocaleString("en-US", {
-//         timeZone: "America/New_York",
-//       });
-//       const todayStr = new Date(todayEST).toISOString().split("T")[0];
+//       // Get today's date in EST
+//       const todayEST = moment().tz("America/New_York").format("YYYY-MM-DD");
 
+//       // Calculate dailyCount
+//       let dailyCount = 0;
 //       c.messages.forEach((msg) => {
-//         const msgEST = new Date(
-//           msg.createdAt.toLocaleString("en-US", {
-//             timeZone: "America/New_York",
-//           })
-//         );
-//         const msgDateStr = msgEST.toISOString().split("T")[0];
-//         if (msgDateStr === todayStr) dailyCount++;
+//         const msgDateEST = moment(msg.createdAt)
+//           .tz("America/New_York")
+//           .format("YYYY-MM-DD");
+//         if (msgDateEST === todayEST) dailyCount++;
 //       });
 
 //       return {
@@ -945,41 +1664,23 @@ app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 // app.get("/report", async (req, res) => {
 //   try {
 //     const { candidateId, from, to } = req.query;
-//     if (!candidateId || !from || !to)
-//       return res
-//         .status(400)
-//         .json({ error: "candidateId, from, and to required" });
+//     if (!candidateId || !from || !to) return res.status(400).json({ error: "candidateId, from, and to required" });
 
-//     const candidate = await prisma.candidate.findUnique({
-//       where: { id: parseInt(candidateId) },
-//     });
-//     if (!candidate)
-//       return res.status(404).json({ error: "Candidate not found" });
+//     const candidate = await prisma.candidate.findUnique({ where: { id: parseInt(candidateId) } });
+//     if (!candidate) return res.status(404).json({ error: "Candidate not found" });
 
-//     const fromDateUTC = moment
-//       .tz(`${from} 00:00:00`, "YYYY-MM-DD HH:mm:ss", "America/New_York")
-//       .utc()
-//       .toDate();
-//     const toDateUTC = moment
-//       .tz(`${to} 23:59:59`, "YYYY-MM-DD HH:mm:ss", "America/New_York")
-//       .utc()
-//       .toDate();
+//     const fromDateUTC = moment.tz(`${from} 00:00:00`, "YYYY-MM-DD HH:mm:ss", "America/New_York").utc().toDate();
+//     const toDateUTC = moment.tz(`${to} 23:59:59`, "YYYY-MM-DD HH:mm:ss", "America/New_York").utc().toDate();
 
 //     const messages = await prisma.message.findMany({
-//       where: {
-//         candidateId: candidate.id,
-//         createdAt: { gte: fromDateUTC, lte: toDateUTC },
-//       },
-//       orderBy: { createdAt: "asc" },
+//       where: { candidateId: candidate.id, createdAt: { gte: fromDateUTC, lte: toDateUTC } },
+//       orderBy: { createdAt: "asc" }
 //     });
 
 //     const dailyMap = {};
 //     messages.forEach((msg) => {
-//       const estDate = moment(msg.createdAt)
-//         .tz("America/New_York")
-//         .format("YYYY-MM-DD");
-//       if (!dailyMap[estDate])
-//         dailyMap[estDate] = { count: 0, platformCount: 0, companyCount: 0 };
+//       const estDate = moment(msg.createdAt).tz("America/New_York").format("YYYY-MM-DD");
+//       if (!dailyMap[estDate]) dailyMap[estDate] = { count: 0, platformCount: 0, companyCount: 0 };
 //       dailyMap[estDate].count++;
 //       const source = detectMailSource(msg.from);
 //       if (source === "platform") dailyMap[estDate].platformCount++;
@@ -989,1831 +1690,22 @@ app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 //     const allDates = [];
 //     let curr = moment.tz(from, "America/New_York");
 //     const end = moment.tz(to, "America/New_York");
-
 //     while (curr.isSameOrBefore(end)) {
 //       const day = curr.day();
 //       if (day !== 0 && day !== 6) {
 //         const dateStr = curr.format("YYYY-MM-DD");
-//         allDates.push({
-//           cycleStart: dateStr,
-//           count: dailyMap[dateStr]?.count || 0,
-//           platformCount: dailyMap[dateStr]?.platformCount || 0,
-//           companyCount: dailyMap[dateStr]?.companyCount || 0,
-//         });
+//         allDates.push({ cycleStart: dateStr, count: dailyMap[dateStr]?.count || 0, platformCount: dailyMap[dateStr]?.platformCount || 0, companyCount: dailyMap[dateStr]?.companyCount || 0 });
 //       }
 //       curr.add(1, "day");
 //     }
 
 //     const totalCount = allDates.reduce((sum, d) => sum + d.count, 0);
-//     const platformCountTotal = allDates.reduce(
-//       (sum, d) => sum + d.platformCount,
-//       0
-//     );
-//     const companyCountTotal = allDates.reduce(
-//       (sum, d) => sum + d.companyCount,
-//       0
-//     );
+//     const platformCountTotal = allDates.reduce((sum, d) => sum + d.platformCount, 0);
+//     const companyCountTotal = allDates.reduce((sum, d) => sum + d.companyCount, 0);
 
-//     res.json({
-//       totalCount,
-//       platformCountTotal,
-//       companyCountTotal,
-//       dailyCounts: allDates,
-//     });
-//   } catch (err) {
-//     console.error("Report fetch error:", err);
-//     res.status(500).json({ error: "Failed to fetch report" });
-//   }
+//     res.json({ totalCount, platformCountTotal, companyCountTotal, dailyCounts: allDates });
+//   } catch (err) { console.error("Report fetch error:", err); res.status(500).json({ error: "Failed to fetch report" }); }
 // });
 
 // // -------------------- START SERVER --------------------
 // app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-
-
-
-
-
-
-
-
-
-
-
-// require("dotenv").config();
-// const express = require("express");
-// const cors = require("cors");
-// const { PrismaClient } = require("@prisma/client");
-// const { google } = require("googleapis");
-// const cron = require("node-cron");
-// const jwt = require("jsonwebtoken");
-// const moment = require("moment-timezone");
-
-// const prisma = new PrismaClient();
-// const app = express();
-// app.use(cors());
-// app.use(express.json());
-
-// const PORT = process.env.PORT || 5000;
-// const CLIENT_ID = process.env.CLIENT_ID || "";
-// const CLIENT_SECRET = process.env.CLIENT_SECRET || "";
-// const REDIRECT_URI =
-//   process.env.REDIRECT_URI || "http://localhost:5000/oauth2callback";
-// const CRON_INTERVAL = process.env.CRON_INTERVAL || 2; // in minutes
-
-// // -------------------- HEALTH CHECK --------------------
-// app.get("/", (req, res) => res.send({ status: "ok" }));
-
-// // -------------------- LOGIN --------------------
-// // -------------------- LOGIN (DB based) --------------------
-// app.post("/login", async (req, res) => {
-//   const { username, password } = req.body;
-//   try {
-//     const admin = await prisma.admin.findUnique({ where: { username } });
-//     if (!admin || admin.password !== password)
-//       return res.status(401).json({ error: "Invalid username or password" });
-
-//     const token = jwt.sign({ username }, "supersecretkey", { expiresIn: "1h" });
-//     res.json({ token, username });
-//   } catch (err) {
-//     console.error("Login error:", err);
-//     res.status(500).json({ error: "Login failed" });
-//   }
-// });
-
-// // -------------------- FORGOT PASSWORD (get question) --------------------
-// // -------------------- FORGOT PASSWORD (get question) --------------------
-// app.post("/forgot-password-question", async (req, res) => {
-//   const { username } = req.body || {};
-//   try {
-//     let admin = null;
-
-//     if (username && username.trim() !== "") {
-//       admin = await prisma.admin.findUnique({ where: { username: username.trim() } });
-//     }
-
-//     // fallback: if no admin by username, use the first admin row as default
-//     if (!admin) {
-//       admin = await prisma.admin.findFirst();
-//       if (!admin) return res.status(404).json({ error: "No admin found" });
-//     }
-
-//     res.json({ question: admin.question });
-//   } catch (err) {
-//     console.error("Forgot question error:", err);
-//     res.status(500).json({ error: "Failed to get question" });
-//   }
-// });
-
-// // -------------------- VERIFY ANSWER --------------------
-// app.post("/verify-answer", async (req, res) => {
-//   const { username, answer } = req.body || {};
-//   try {
-//     let admin = null;
-
-//     if (username && username.trim() !== "") {
-//       admin = await prisma.admin.findUnique({ where: { username: username.trim() } });
-//     }
-
-//     // fallback to first admin if username not supplied or not found
-//     if (!admin) {
-//       admin = await prisma.admin.findFirst();
-//       if (!admin) return res.status(404).json({ error: "No admin found" });
-//     }
-
-//     // compare answers case-insensitive and trimmed
-//     const provided = (answer || "").trim().toLowerCase();
-//     const stored = (admin.answer || "").trim().toLowerCase();
-
-//     if (provided !== stored) {
-//       return res.status(401).json({ error: "Incorrect answer" });
-//     }
-
-//     res.json({ success: true });
-//   } catch (err) {
-//     console.error("Verify answer error:", err);
-//     res.status(500).json({ error: "Verification failed" });
-//   }
-// });
-
-
-// // -------------------- RESET CREDENTIALS --------------------
-// app.post("/reset-credentials", async (req, res) => {
-//   const { username, newUsername, newPassword, confirmPassword } = req.body;
-//   if (newPassword !== confirmPassword)
-//     return res.status(400).json({ error: "Passwords do not match" });
-
-//   try {
-//     const admin = await prisma.admin.findUnique({ where: { username } });
-//     if (!admin)
-//       return res.status(404).json({ error: "User not found" });
-
-//     await prisma.admin.update({
-//       where: { id: admin.id },
-//       data: { username: newUsername, password: newPassword },
-//     });
-//     res.json({ success: true, message: "Credentials updated successfully" });
-//   } catch (err) {
-//     console.error("Reset credentials error:", err);
-//     res.status(500).json({ error: "Failed to update credentials" });
-//   }
-// });
-
-
-// // -------------------- ADD CANDIDATE --------------------
-// app.post("/candidates", async (req, res) => {
-//   const { name, email } = req.body;
-//   if (!name || !email)
-//     return res.status(400).json({ error: "name and email required" });
-
-//   try {
-//     const newCandidate = await prisma.candidate.create({
-//       data: { name, email, count: 0, platformCount: 0, companyCount: 0 },
-//     });
-//     res.status(201).json(newCandidate);
-//   } catch (err) {
-//     console.error("Error adding candidate:", err.message || err);
-//     if (err.code === "P2002")
-//       return res
-//         .status(409)
-//         .json({ error: "Candidate with this email already exists" });
-//     res.status(500).json({ error: "Failed to add candidate" });
-//   }
-// });
-
-// // -------------------- DELETE CANDIDATE --------------------
-// app.delete("/candidates/:id", async (req, res) => {
-//   try {
-//     const { id } = req.params;
-//     await prisma.message.deleteMany({ where: { candidateId: parseInt(id) } });
-//     await prisma.candidate.delete({ where: { id: parseInt(id) } });
-//     res.json({ success: true, message: "Candidate deleted" });
-//   } catch (err) {
-//     console.error("Delete candidate error:", err.message || err);
-//     res.status(500).json({ error: "Failed to delete candidate" });
-//   }
-// });
-
-// // -------------------- AUTH --------------------
-// app.get("/auth/:candidateId", async (req, res) => {
-//   const { candidateId } = req.params;
-//   const oAuth2Client = new google.auth.OAuth2(
-//     CLIENT_ID,
-//     CLIENT_SECRET,
-//     REDIRECT_URI
-//   );
-//   const authUrl = oAuth2Client.generateAuthUrl({
-//     access_type: "offline",
-//     scope: ["https://www.googleapis.com/auth/gmail.readonly"],
-//     state: candidateId,
-//     prompt: "consent",
-//   });
-//   res.redirect(authUrl);
-// });
-
-// app.get("/oauth2callback", async (req, res) => {
-//   try {
-//     const code = req.query.code;
-//     const candidateId = req.query.state;
-//     if (!code || !candidateId)
-//       return res.status(400).send("Missing code or state.");
-
-//     const oAuth2Client = new google.auth.OAuth2(
-//       CLIENT_ID,
-//       CLIENT_SECRET,
-//       REDIRECT_URI
-//     );
-//     const { tokens } = await oAuth2Client.getToken(code);
-//     oAuth2Client.setCredentials(tokens);
-
-//     const profile = await google
-//       .gmail({ version: "v1", auth: oAuth2Client })
-//       .users.getProfile({ userId: "me" });
-//     const googleEmail = profile?.data?.emailAddress || "";
-
-//     const candidate = await prisma.candidate.findUnique({
-//       where: { id: parseInt(candidateId) },
-//     });
-//     if (!candidate) return res.status(404).send("Candidate not found.");
-//     if (
-//       candidate.email.toLowerCase().trim() !== googleEmail.toLowerCase().trim()
-//     )
-//       return res
-//         .status(400)
-//         .send(
-//           `Authorized Google account (${googleEmail}) does not match candidate email (${candidate.email}).`
-//         );
-
-//     await prisma.candidate.update({
-//       where: { id: candidate.id },
-//       data: {
-//         accessToken: tokens.access_token || null,
-//         refreshToken: tokens.refresh_token || null,
-//       },
-//     });
-
-//     res.send("✅ OAuth Success — account verified and tokens saved.");
-//   } catch (err) {
-//     console.error("OAuth callback error:", err.message || err);
-//     res.status(500).send("OAuth failed");
-//   }
-// });
-
-// // -------------------- DETECT MAIL SOURCE --------------------
-// function detectMailSource(fromEmail) {
-//   if (!fromEmail || fromEmail === "Unknown") return "company";
-
-//   const email = fromEmail.toLowerCase();
-//   const platforms = [
-//     "linkedin.com",
-//     "indeed.com",
-//     "glassdoor.com",
-//     "simplyhired.com",
-//     "dice.com",
-//     "monster.com",
-//     "careerbuilder.com",
-//     "apexsystems.com",
-//     "ziprecruiter.com",
-//     "randstad.com",
-//     "roberthalf.com",
-//     "brooksource.com",
-//     "insightglobal.com",
-//     "teksystems.com",
-//     "kforce.com",
-//     "levels.fyi",
-//     "talenty.io",
-//     "jobright.com",
-//     "swooped.com",
-//     "simplify.com",
-//     "builtin.com",
-//     "workable.com",
-//   ];
-
-//   return platforms.some((domain) => email.includes(domain))
-//     ? "platform"
-//     : "company";
-// }
-
-// // -------------------- CHECK MAILS & UPDATE COUNT --------------------
-// function extractAllTextFromPayload(payload) {
-//   let acc = "";
-
-//   function walk(part) {
-//     if (!part) return;
-//     if (part.body && part.body.data) {
-//       try {
-//         acc += Buffer.from(part.body.data, "base64").toString("utf-8") + " ";
-//       } catch (e) {}
-//     }
-//     if (part.parts && Array.isArray(part.parts)) {
-//       part.parts.forEach(walk);
-//     }
-//   }
-
-//   walk(payload);
-//   acc = acc.replace(/<[^>]+>/g, " ");
-//   acc = acc.replace(/&nbsp;|&amp;|&lt;|&gt;|&quot;|&#39;/g, " ");
-//   return acc;
-// }
-// async function checkMailsAndUpdateCount() {
-//   const subjects = [
-//     "Thank you for applying",
-//     "Thank you for applying!",
-//     "Thanks for applying",
-//     "We received your",
-//     "Application Received",
-//     "Your application for the position",
-//     "Your recent application for the position",
-//     "we've received",
-//     "We have successfully received your application",
-//     "Submitted:",
-//     "we have received",
-//     "submitted",
-//     "your application was sent",
-//     "Submission",
-//     "Thank you for your application",
-//     "Thank you for your application!",
-//     "Thank you for the application",
-//     "Application was received",
-//     "Thanks for your application",
-//     "Thanks for completing your application",
-//     "has been received",
-//     "Indeed Application:",
-//     "We received your application",
-//     "we received your job application",
-//     "we received job application",
-//     "Application Acknowledgement",
-//     "Thank you for your interest",
-//     "Thank you for your job application",
-//     "your resume was received",
-//     "Thank you for submitting your application",
-//   ];
-
-//   const query = "subject:(" + subjects.map((s) => `"${s}"`).join(" OR ") + ")";
-//   const maxFetch = 100000;
-
-//   const rejectRegex = /(not|won't|unable|unfortunate|unfortunately|unfortunately,|pursue other candidates|with other candidates|regret to inform|declined|position has been filled|no longer under consideration|unfortunate|another candidate|another candidate.)/i;
-//   const forwardRegex = /forwarded message|-----original message-----/i;
-
-//   const candidates = await prisma.candidate.findMany({
-//     where: { refreshToken: { not: null } },
-//   });
-//   if (!candidates || candidates.length === 0) return;
-
-//   for (const candidate of candidates) {
-//     if (!candidate.accessToken && !candidate.refreshToken) continue;
-
-//     try {
-//       const client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
-//       client.setCredentials({
-//         access_token: candidate.accessToken,
-//         refresh_token: candidate.refreshToken,
-//       });
-//       const gmail = google.gmail({ version: "v1", auth: client });
-
-//       let allMessages = [];
-//       let nextPageToken = null;
-
-//       do {
-//         const listRes = await gmail.users.messages.list({
-//           userId: "me",
-//           q: query,
-//           labelIds: ["INBOX"],
-//           maxResults: 100,
-//           pageToken: nextPageToken,
-//         });
-//         if (listRes.data.messages) allMessages = allMessages.concat(listRes.data.messages);
-//         nextPageToken = listRes.data.nextPageToken;
-//         if (allMessages.length >= maxFetch) break;
-//       } while (nextPageToken);
-
-//       allMessages = allMessages.slice(0, maxFetch);
-
-//       for (const m of allMessages) {
-//         const exists = await prisma.message.findUnique({ where: { id: m.id } });
-//         if (exists) continue;
-
-//         const msg = await gmail.users.messages.get({ userId: "me", id: m.id });
-//         const msgTime = parseInt(msg.data.internalDate);
-//         const msgDateUTC = new Date(msgTime);
-
-//         let fromHeader = "Unknown";
-//         let subject = "";
-//         let bodyRaw = "";
-
-//         if (msg.data?.payload?.headers) {
-//           for (const h of msg.data.payload.headers) {
-//             if (h.name.toLowerCase() === "from") fromHeader = h.value;
-//             if (h.name.toLowerCase() === "subject") subject = h.value || "";
-//           }
-//         }
-
-//         if (msg.data?.payload) {
-//           bodyRaw = extractAllTextFromPayload(msg.data.payload);
-//         }
-
-//         if (!bodyRaw || bodyRaw.trim().length < 10) {
-//           try {
-//             const rawMsg = await gmail.users.messages.get({
-//               userId: "me",
-//               id: m.id,
-//               format: "raw",
-//             });
-//             bodyRaw = Buffer.from(rawMsg.data.raw, "base64").toString("utf-8");
-//           } catch (e) {}
-//         }
-
-//         let body = bodyRaw
-//           .replace(/[\r\n]+/g, " ")
-//           .replace(/\u00A0/g, " ")
-//           .replace(/\u200B/g, "")
-//           .replace(/\u00AD/g, "")
-//           .replace(/\s+/g, " ")
-//           .trim()
-//           .toLowerCase();
-//         subject = subject.toLowerCase();
-
-//         if (
-//           subject.includes("thank you for your interest") &&
-//           (rejectRegex.test(body) || forwardRegex.test(body))
-//         ) {
-//           continue;
-//         }
-
-//         const source = detectMailSource(fromHeader);
-
-//         await prisma.message.create({
-//           data: {
-//             id: m.id,
-//             candidateId: candidate.id,
-//             createdAt: msgDateUTC,
-//             from: fromHeader,
-//           },
-//         });
-
-//         const updateTotalData = { count: { increment: 1 } };
-//         if (source === "platform") updateTotalData.platformCount = { increment: 1 };
-//         else updateTotalData.companyCount = { increment: 1 };
-
-//         await prisma.candidate.update({
-//           where: { id: candidate.id },
-//           data: updateTotalData,
-//         });
-//       }
-//     } catch (err) {
-//       console.error(`Error processing ${candidate.email}:`, err);
-
-//       // -------------------- TOKEN EXPIRED / INVALID --------------------
-//       if (
-//         err.code === 401 || // unauthorized                                                                                                                                                             
-//         (err.errors && err.errors[0]?.reason === "invalid_grant")
-//       ) {
-//         console.log(`Tokens invalid for candidate ${candidate.email}, nullifying...`);
-//         await prisma.candidate.update({
-//           where: { id: candidate.id },
-//           data: {
-//             accessToken: null,
-//             refreshToken: null,
-//           },
-//         });
-//       }
-//     }
-//   }
-// }
-
-
-
-
-
-// // -------------------- CRON JOB --------------------
-// cron.schedule(`*/${CRON_INTERVAL} * * * *`, () => {
-//   console.log("⏰ Running mail check every", CRON_INTERVAL, "minutes");
-//   checkMailsAndUpdateCount();
-// });
-
-// // -------------------- GET CANDIDATES --------------------
-// app.get("/candidates", async (req, res) => {
-//   try {
-//     const candidates = await prisma.candidate.findMany({
-//       include: { messages: true },
-//       orderBy: { createdAt: "desc" },
-//     });
-
-//     const result = candidates.map((c) => {
-//       let dailyCount = 0;
-//       const todayEST = new Date().toLocaleString("en-US", {
-//         timeZone: "America/New_York",
-//       });
-//       const todayStr = new Date(todayEST).toISOString().split("T")[0];
-
-//       c.messages.forEach((msg) => {
-//         const msgEST = new Date(
-//           msg.createdAt.toLocaleString("en-US", {
-//             timeZone: "America/New_York",
-//           })
-//         );
-//         const msgDateStr = msgEST.toISOString().split("T")[0];
-//         if (msgDateStr === todayStr) dailyCount++;
-//       });
-
-//       return {
-//         id: c.id,
-//         name: c.name,
-//         email: c.email,
-//         totalCount: c.count,
-//         platformCount: c.platformCount,
-//         companyCount: c.companyCount,
-//         dailyCount,
-//         accessToken: c.accessToken,
-//       };
-//     });
-
-//     res.json(result);
-//   } catch (err) {
-//     console.error("Get candidates error:", err);
-//     res.status(500).json({ error: "Failed to fetch candidates" });
-//   }
-// });
-
-// // -------------------- REPORT --------------------
-// app.get("/report", async (req, res) => {
-//   try {
-//     const { candidateId, from, to } = req.query;
-//     if (!candidateId || !from || !to)
-//       return res
-//         .status(400)
-//         .json({ error: "candidateId, from, and to required" });
-
-//     const candidate = await prisma.candidate.findUnique({
-//       where: { id: parseInt(candidateId) },
-//     });
-//     if (!candidate)
-//       return res.status(404).json({ error: "Candidate not found" });
-
-//     const fromDateUTC = moment
-//       .tz(`${from} 00:00:00`, "YYYY-MM-DD HH:mm:ss", "America/New_York")
-//       .utc()
-//       .toDate();
-//     const toDateUTC = moment
-//       .tz(`${to} 23:59:59`, "YYYY-MM-DD HH:mm:ss", "America/New_York")
-//       .utc()
-//       .toDate();
-
-//     const messages = await prisma.message.findMany({
-//       where: {
-//         candidateId: candidate.id,
-//         createdAt: { gte: fromDateUTC, lte: toDateUTC },
-//       },
-//       orderBy: { createdAt: "asc" },
-//     });
-
-//     const dailyMap = {};
-//     messages.forEach((msg) => {
-//       const estDate = moment(msg.createdAt)
-//         .tz("America/New_York")
-//         .format("YYYY-MM-DD");
-//       if (!dailyMap[estDate])
-//         dailyMap[estDate] = { count: 0, platformCount: 0, companyCount: 0 };
-//       dailyMap[estDate].count++;
-//       const source = detectMailSource(msg.from);
-//       if (source === "platform") dailyMap[estDate].platformCount++;
-//       else dailyMap[estDate].companyCount++;
-//     });
-
-//     const allDates = [];
-//     let curr = moment.tz(from, "America/New_York");
-//     const end = moment.tz(to, "America/New_York");
-
-//     while (curr.isSameOrBefore(end)) {
-//       const day = curr.day();
-//       if (day !== 0 && day !== 6) {
-//         const dateStr = curr.format("YYYY-MM-DD");
-//         allDates.push({
-//           cycleStart: dateStr,
-//           count: dailyMap[dateStr]?.count || 0,
-//           platformCount: dailyMap[dateStr]?.platformCount || 0,
-//           companyCount: dailyMap[dateStr]?.companyCount || 0,
-//         });
-//       }
-//       curr.add(1, "day");
-//     }
-
-//     const totalCount = allDates.reduce((sum, d) => sum + d.count, 0);
-//     const platformCountTotal = allDates.reduce(
-//       (sum, d) => sum + d.platformCount,
-//       0
-//     );
-//     const companyCountTotal = allDates.reduce(
-//       (sum, d) => sum + d.companyCount,
-//       0
-//     );
-
-//     res.json({
-//       totalCount,
-//       platformCountTotal,
-//       companyCountTotal,
-//       dailyCounts: allDates,
-//     });
-//   } catch (err) {
-//     console.error("Report fetch error:", err);
-//     res.status(500).json({ error: "Failed to fetch report" });
-//   }
-// });
-
-// // -------------------- START SERVER --------------------
-// app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-
-
-
-
-
-
-
-
-// async function checkMailsAndUpdateCount() {
-//   const subjects = [
-//     "Thank you for applying",
-//     "Thank you for applying!",
-//     "Submission Received",
-//     "Thanks for applying",
-//     "Submission Confirmation",
-//     "We received your",
-//     "Application Received",
-//     "Your application for the position",
-//     "Your recent application for the position",
-//     "we've received",
-//     "We have successfully received your application",
-//     "Submitted:",
-//     "we have received",
-//     "submitted",
-//     "your application was sent",
-//     "submission",
-//     "Thank you for your application",
-//     "Thank you for your application!",
-//     "Thank you for the application",
-//     "Application was received",
-//     "Thanks for your application",
-//     "Thanks for completing your application",
-//     "has been received",
-//     "Indeed Application:",
-//     "We received your application",
-//     "we received your job application",
-//     "we received job application",
-//     "Application Acknowledgement",
-//     "Thank you for your interest",
-//     "Thank you for your job application",
-//     "your resume was received",
-//     "Thank you for submitting your application",
-//   ];
-
-//   const query =
-//     "subject:(" + subjects.map((s) => `\"${s}\"`).join(" OR ") + ")";
-//   const maxFetch = 100000;
-
-//   const rejectRegex =
-//     /(not|unable|unfortunately|pursue other candidates|with other candidates|regret to inform|declined|position has been filled|no longer under consideration|unfortunate|another candidate)/i;
-//   const forwardRegex = /forwarded message|-----original message-----/i;
-
-//   const candidates = await prisma.candidate.findMany({
-//     where: { refreshToken: { not: null } },
-//   });
-//   if (!candidates || candidates.length === 0) return;
-
-//   for (const candidate of candidates) {
-//     if (!candidate.accessToken && !candidate.refreshToken) continue;
-
-//     try {
-//       const client = new google.auth.OAuth2(
-//         CLIENT_ID,
-//         CLIENT_SECRET,
-//         REDIRECT_URI
-//       );
-//       client.setCredentials({
-//         access_token: candidate.accessToken,
-//         refresh_token: candidate.refreshToken,
-//       });
-//       const gmail = google.gmail({ version: "v1", auth: client });
-
-//       let allMessages = [];
-//       let nextPageToken = null;
-
-//       do {
-//         const listRes = await gmail.users.messages.list({
-//           userId: "me",
-//           q: query,
-//           labelIds: ["INBOX"],
-//           maxResults: 100,
-//           pageToken: nextPageToken,
-//         });
-//         if (listRes.data.messages)
-//           allMessages = allMessages.concat(listRes.data.messages);
-//         nextPageToken = listRes.data.nextPageToken;
-//         if (allMessages.length >= maxFetch) break;
-//       } while (nextPageToken);
-
-//       allMessages = allMessages.slice(0, maxFetch);
-
-//       for (const m of allMessages) {
-//         const exists = await prisma.message.findUnique({ where: { id: m.id } });
-//         if (exists) continue;
-
-//         const msg = await gmail.users.messages.get({ userId: "me", id: m.id });
-//         const msgTime = parseInt(msg.data.internalDate);
-//         const msgDateUTC = new Date(msgTime);
-
-//         let fromHeader = "Unknown";
-//         let subject = "";
-//         let bodyRaw = "";
-
-//         if (msg.data?.payload?.headers) {
-//           for (const h of msg.data.payload.headers) {
-//             if (h.name.toLowerCase() === "from") fromHeader = h.value;
-//             if (h.name.toLowerCase() === "subject") subject = h.value || "";
-//           }
-//         }
-
-//         if (msg.data?.payload) {
-//           bodyRaw = extractAllTextFromPayload(msg.data.payload);
-//         }
-
-//         if (!bodyRaw || bodyRaw.trim().length < 10) {
-//           try {
-//             const rawMsg = await gmail.users.messages.get({
-//               userId: "me",
-//               id: m.id,
-//               format: "raw",
-//             });
-//             bodyRaw = Buffer.from(rawMsg.data.raw, "base64").toString("utf-8");
-//           } catch (e) {}
-//         }
-
-//         let body = bodyRaw
-//           .replace(/[\r\n]+/g, " ")
-//           .replace(/\u00A0/g, " ")
-//           .replace(/\u200B/g, "")
-//           .replace(/\u00AD/g, "")
-//           .replace(/\s+/g, " ")
-//           .trim()
-//           .toLowerCase();
-//         subject = subject.toLowerCase();
-
-//         // Skip rejected or forwarded mails
-//         if (
-//           subject.includes("thank you for your interest") &&
-//           (rejectRegex.test(body) || forwardRegex.test(body))
-//         ) {
-//           continue;
-//         }
-
-//         // ------------------ NEW CHECK ------------------
-//         const candidateExists = await prisma.candidate.findUnique({
-//           where: { id: candidate.id },
-//         });
-//         if (!candidateExists) {
-//           console.log(
-//             `Candidate ${candidate.id} not found, skipping message ${m.id}`
-//           );
-//           continue;
-//         }
-
-//         const source = detectMailSource(fromHeader);
-
-//         await prisma.message.create({
-//           data: {
-//             id: m.id,
-//             candidateId: candidate.id,
-//             createdAt: msgDateUTC,
-//             from: fromHeader,
-//           },
-//         });
-
-//         const updateTotalData = { count: { increment: 1 } };
-//         if (source === "platform")
-//           updateTotalData.platformCount = { increment: 1 };
-//         else updateTotalData.companyCount = { increment: 1 };
-
-//         await prisma.candidate.update({
-//           where: { id: candidate.id },
-//           data: updateTotalData,
-//         });
-//       }
-//     } catch (err) {
-//       console.error(`Error processing ${candidate.email}:`, err);
-//     }
-//   }
-// }
-
-
-
-
-
-
-
-
-// require("dotenv").config();
-// const express = require("express");
-// const cors = require("cors");
-// const { PrismaClient } = require("@prisma/client");
-// const { google } = require("googleapis");
-// const cron = require("node-cron");
-// const jwt = require("jsonwebtoken");
-// const moment = require("moment-timezone");
-
-// const prisma = new PrismaClient();
-// const app = express();
-// app.use(cors());
-// app.use(express.json());
-
-// const PORT = process.env.PORT || 5000;
-// const CLIENT_ID = process.env.CLIENT_ID || "";
-// const CLIENT_SECRET = process.env.CLIENT_SECRET || "";
-// const REDIRECT_URI =
-//   process.env.REDIRECT_URI || "http://localhost:5000/oauth2callback";
-// const CRON_INTERVAL = process.env.CRON_INTERVAL || 2; // in minutes
-
-// // -------------------- HEALTH CHECK --------------------
-// app.get("/", (req, res) => res.send({ status: "ok" }));
-
-// // -------------------- LOGIN --------------------
-// app.post("/login", (req, res) => {
-//   const { username, password } = req.body;
-//   const FIXED_USERNAME = "crr7t";
-//   const FIXED_PASSWORD = "ramramji";
-
-//   if (username === FIXED_USERNAME && password === FIXED_PASSWORD) {
-//     const token = jwt.sign({ username }, "supersecretkey", { expiresIn: "1h" });
-//     return res.json({ token, username });
-//   }
-//   return res.status(401).json({ error: "Invalid username or password" });
-// });
-
-// // -------------------- ADD CANDIDATE --------------------
-// app.post("/candidates", async (req, res) => {
-//   const { name, email } = req.body;
-//   if (!name || !email)
-//     return res.status(400).json({ error: "name and email required" });
-
-//   try {
-//     const newCandidate = await prisma.candidate.create({
-//       data: { name, email, count: 0, platformCount: 0, companyCount: 0 },
-//     });
-//     res.status(201).json(newCandidate);
-//   } catch (err) {
-//     console.error("Error adding candidate:", err.message || err);
-//     if (err.code === "P2002")
-//       return res
-//         .status(409)
-//         .json({ error: "Candidate with this email already exists" });
-//     res.status(500).json({ error: "Failed to add candidate" });
-//   }
-// });
-
-// // -------------------- DELETE CANDIDATE --------------------
-// app.delete("/candidates/:id", async (req, res) => {
-//   try {
-//     const { id } = req.params;
-//     await prisma.message.deleteMany({ where: { candidateId: parseInt(id) } });
-//     await prisma.candidate.delete({ where: { id: parseInt(id) } });
-//     res.json({ success: true, message: "Candidate deleted" });
-//   } catch (err) {
-//     console.error("Delete candidate error:", err.message || err);
-//     res.status(500).json({ error: "Failed to delete candidate" });
-//   }
-// });
-
-// // -------------------- AUTH --------------------
-// app.get("/auth/:candidateId", async (req, res) => {
-//   const { candidateId } = req.params;
-//   const oAuth2Client = new google.auth.OAuth2(
-//     CLIENT_ID,
-//     CLIENT_SECRET,
-//     REDIRECT_URI
-//   );
-//   const authUrl = oAuth2Client.generateAuthUrl({
-//     access_type: "offline",
-//     scope: ["https://www.googleapis.com/auth/gmail.readonly"],
-//     state: candidateId,
-//     prompt: "consent",
-//   });
-//   res.redirect(authUrl);
-// });
-
-// app.get("/oauth2callback", async (req, res) => {
-//   try {
-//     const code = req.query.code;
-//     const candidateId = req.query.state;
-//     if (!code || !candidateId)
-//       return res.status(400).send("Missing code or state.");
-
-//     const oAuth2Client = new google.auth.OAuth2(
-//       CLIENT_ID,
-//       CLIENT_SECRET,
-//       REDIRECT_URI
-//     );
-//     const { tokens } = await oAuth2Client.getToken(code);
-//     oAuth2Client.setCredentials(tokens);
-
-//     const profile = await google
-//       .gmail({ version: "v1", auth: oAuth2Client })
-//       .users.getProfile({ userId: "me" });
-//     const googleEmail = profile?.data?.emailAddress || "";
-
-//     const candidate = await prisma.candidate.findUnique({
-//       where: { id: parseInt(candidateId) },
-//     });
-//     if (!candidate) return res.status(404).send("Candidate not found.");
-//     if (
-//       candidate.email.toLowerCase().trim() !== googleEmail.toLowerCase().trim()
-//     )
-//       return res
-//         .status(400)
-//         .send(
-//           `Authorized Google account (${googleEmail}) does not match candidate email (${candidate.email}).`
-//         );
-
-//     await prisma.candidate.update({
-//       where: { id: candidate.id },
-//       data: {
-//         accessToken: tokens.access_token || null,
-//         refreshToken: tokens.refresh_token || null,
-//       },
-//     });
-
-//     res.send("✅ OAuth Success — account verified and tokens saved.");
-//   } catch (err) {
-//     console.error("OAuth callback error:", err.message || err);
-//     res.status(500).send("OAuth failed");
-//   }
-// });
-
-// // -------------------- DETECT MAIL SOURCE --------------------
-// function detectMailSource(fromEmail) {
-//   if (!fromEmail || fromEmail === "Unknown") return "company";
-
-//   const email = fromEmail.toLowerCase();
-//   const platforms = [
-//     "linkedin.com",
-//     "indeed.com",
-//     "glassdoor.com",
-//     "simplyhired.com",
-//     "dice.com",
-//     "monster.com",
-//     "careerbuilder.com",
-//     "apexsystems.com",
-//     "ziprecruiter.com",
-//     "randstad.com",
-//     "roberthalf.com",
-//     "brooksource.com",
-//     "insightglobal.com",
-//     "teksystems.com",
-//     "kforce.com",
-//     "levels.fyi",
-//     "talenty.io",
-//     "jobright.com",
-//     "swooped.com",
-//     "simplify.com",
-//     "builtin.com",
-//     "workable.com",
-//   ];
-
-//   return platforms.some((domain) => email.includes(domain))
-//     ? "platform"
-//     : "company";
-// }
-
-// // -------------------- CHECK MAILS & UPDATE COUNT --------------------
-// // Helper: recursively extract text from payload
-// function extractAllTextFromPayload(payload) {
-//   let acc = "";
-
-//   function walk(part) {
-//     if (!part) return;
-//     if (part.body && part.body.data) {
-//       try {
-//         acc += Buffer.from(part.body.data, "base64").toString("utf-8") + " ";
-//       } catch (e) {}
-//     }
-//     if (part.parts && Array.isArray(part.parts)) {
-//       part.parts.forEach(walk);
-//     }
-//   }
-
-//   walk(payload);
-//   // strip tags
-//   acc = acc.replace(/<[^>]+>/g, " ");
-//   // decode common HTML entities
-//   acc = acc.replace(/&nbsp;|&amp;|&lt;|&gt;|&quot;|&#39;/g, " ");
-//   return acc;
-// }
-
-// async function checkMailsAndUpdateCount() {
-//   const subjects = [
-//     "Thank you for applying",
-//     "Thank you for applying!",
-//     "Submission Received",
-//     "Thanks for applying",
-//     "Submission Confirmation",
-//     "We received your",
-//     "Application Received",
-//     "Your application for the position",
-//     "Your recent application for the position",
-//     "we've received",
-//     "We have successfully received your application",
-//     "Submitted:",
-//     "we have received",
-//     "submitted",
-//     "your application was sent",
-//     "submission",
-//     "Thank you for your application",
-//     "Thank you for your application!",
-//     "Thank you for the application",
-//     "Application was received",
-//     "Thanks for your application",
-//     "Thanks for completing your application",
-//     "has been received",
-//     "Indeed Application:",
-//     "We received your application",
-//     "we received your job application",
-//     "we received job application",
-//     "Application Acknowledgement",
-//     "Thank you for your interest",
-//     "Thank you for your job application",
-//     "your resume was received",
-//     "Thank you for submitting your application",
-//   ];
-
-//   const query =
-//     "subject:(" + subjects.map((s) => `\"${s}\"`).join(" OR ") + ")";
-//   const maxFetch = 100000;
-
-//   const rejectRegex =
-//     /(not|unable|unfortunately|pursue other candidates|with other candidates|regret to inform|declined|position has been filled|no longer under consideration|unfortunate|another candidate)/i;
-//   const forwardRegex = /forwarded message|-----original message-----/i;
-
-//   const candidates = await prisma.candidate.findMany({
-//     where: { refreshToken: { not: null } },
-//   });
-//   if (!candidates || candidates.length === 0) return;
-
-//   for (const candidate of candidates) {
-//     if (!candidate.accessToken && !candidate.refreshToken) continue;
-
-//     try {
-//       const client = new google.auth.OAuth2(
-//         CLIENT_ID,
-//         CLIENT_SECRET,
-//         REDIRECT_URI
-//       );
-//       client.setCredentials({
-//         access_token: candidate.accessToken,
-//         refresh_token: candidate.refreshToken,
-//       });
-//       const gmail = google.gmail({ version: "v1", auth: client });
-
-//       let allMessages = [];
-//       let nextPageToken = null;
-
-//       do {
-//         const listRes = await gmail.users.messages.list({
-//           userId: "me",
-//           q: query,
-//           labelIds: ["INBOX"],
-//           maxResults: 100,
-//           pageToken: nextPageToken,
-//         });
-//         if (listRes.data.messages)
-//           allMessages = allMessages.concat(listRes.data.messages);
-//         nextPageToken = listRes.data.nextPageToken;
-//         if (allMessages.length >= maxFetch) break;
-//       } while (nextPageToken);
-
-//       allMessages = allMessages.slice(0, maxFetch);
-
-//       for (const m of allMessages) {
-//         const exists = await prisma.message.findUnique({ where: { id: m.id } });
-//         if (exists) continue;
-
-//         const msg = await gmail.users.messages.get({ userId: "me", id: m.id });
-//         const msgTime = parseInt(msg.data.internalDate);
-//         const msgDateUTC = new Date(msgTime);
-
-//         let fromHeader = "Unknown";
-//         let subject = "";
-//         let bodyRaw = "";
-
-//         if (msg.data?.payload?.headers) {
-//           for (const h of msg.data.payload.headers) {
-//             if (h.name.toLowerCase() === "from") fromHeader = h.value;
-//             if (h.name.toLowerCase() === "subject") subject = h.value || "";
-//           }
-//         }
-
-//         if (msg.data?.payload) {
-//           bodyRaw = extractAllTextFromPayload(msg.data.payload);
-//         }
-
-//         if (!bodyRaw || bodyRaw.trim().length < 10) {
-//           try {
-//             const rawMsg = await gmail.users.messages.get({
-//               userId: "me",
-//               id: m.id,
-//               format: "raw",
-//             });
-//             bodyRaw = Buffer.from(rawMsg.data.raw, "base64").toString("utf-8");
-//           } catch (e) {}
-//         }
-
-//         let body = bodyRaw
-//           .replace(/[\r\n]+/g, " ")
-//           .replace(/\u00A0/g, " ")
-//           .replace(/\u200B/g, "")
-//           .replace(/\u00AD/g, "")
-//           .replace(/\s+/g, " ")
-//           .trim()
-//           .toLowerCase();
-//         subject = subject.toLowerCase();
-
-//         if (
-//           subject.includes("thank you for your interest") &&
-//           (rejectRegex.test(body) || forwardRegex.test(body))
-//         ) {
-//           continue;
-//         }
-
-//         const source = detectMailSource(fromHeader);
-
-//         // ✅ Safe check: ensure candidate still exists
-//         const candidateExists = await prisma.candidate.findUnique({
-//           where: { id: candidate.id },
-//         });
-//         if (!candidateExists) {
-//           console.log(`Candidate ${candidate.id} not found, skipping message ${m.id}`);
-//           continue;
-//         }
-
-//         await prisma.message.create({
-//           data: {
-//             id: m.id,
-//             candidateId: candidate.id,
-//             createdAt: msgDateUTC,
-//             from: fromHeader,
-//           },
-//         });
-
-//         const updateTotalData = { count: { increment: 1 } };
-//         if (source === "platform") updateTotalData.platformCount = { increment: 1 };
-//         else updateTotalData.companyCount = { increment: 1 };
-
-//         await prisma.candidate.update({
-//           where: { id: candidate.id },
-//           data: updateTotalData,
-//         });
-//       }
-//     } catch (err) {
-//       console.error(`Error processing ${candidate.email}:`, err);
-//     }
-//   }
-// }
-
-// // -------------------- CRON JOB --------------------
-// cron.schedule(`*/${CRON_INTERVAL} * * * *`, () => {
-//   console.log("⏰ Running mail check every", CRON_INTERVAL, "minutes");
-//   checkMailsAndUpdateCount();
-// });
-
-// // -------------------- GET CANDIDATES --------------------
-// app.get("/candidates", async (req, res) => {
-//   try {
-//     const candidates = await prisma.candidate.findMany({
-//       include: { messages: true },
-//       orderBy: { createdAt: "desc" },
-//     });
-
-//     const result = candidates.map((c) => {
-//       let dailyCount = 0;
-//       const todayEST = new Date().toLocaleString("en-US", {
-//         timeZone: "America/New_York",
-//       });
-//       const todayStr = new Date(todayEST).toISOString().split("T")[0];
-
-//       c.messages.forEach((msg) => {
-//         const msgEST = new Date(
-//           msg.createdAt.toLocaleString("en-US", {
-//             timeZone: "America/New_York",
-//           })
-//         );
-//         const msgDateStr = msgEST.toISOString().split("T")[0];
-//         if (msgDateStr === todayStr) dailyCount++;
-//       });
-
-//       return {
-//         id: c.id,
-//         name: c.name,
-//         email: c.email,
-//         totalCount: c.count,
-//         platformCount: c.platformCount,
-//         companyCount: c.companyCount,
-//         dailyCount,
-//         accessToken: c.accessToken,
-//       };
-//     });
-
-//     res.json(result);
-//   } catch (err) {
-//     console.error("Get candidates error:", err);
-//     res.status(500).json({ error: "Failed to fetch candidates" });
-//   }
-// });
-
-// // -------------------- REPORT --------------------
-// app.get("/report", async (req, res) => {
-//   try {
-//     const { candidateId, from, to } = req.query;
-//     if (!candidateId || !from || !to)
-//       return res
-//         .status(400)
-//         .json({ error: "candidateId, from, and to required" });
-
-//     const candidate = await prisma.candidate.findUnique({
-//       where: { id: parseInt(candidateId) },
-//     });
-//     if (!candidate)
-//       return res.status(404).json({ error: "Candidate not found" });
-
-//     const fromDateUTC = moment
-//       .tz(`${from} 00:00:00`, "YYYY-MM-DD HH:mm:ss", "America/New_York")
-//       .utc()
-//       .toDate();
-//     const toDateUTC = moment
-//       .tz(`${to} 23:59:59`, "YYYY-MM-DD HH:mm:ss", "America/New_York")
-//       .utc()
-//       .toDate();
-
-//     const messages = await prisma.message.findMany({
-//       where: {
-//         candidateId: candidate.id,
-//         createdAt: { gte: fromDateUTC, lte: toDateUTC },
-//       },
-//       orderBy: { createdAt: "asc" },
-//     });
-
-//     const dailyMap = {};
-//     messages.forEach((msg) => {
-//       const estDate = moment(msg.createdAt)
-//         .tz("America/New_York")
-//         .format("YYYY-MM-DD");
-//       if (!dailyMap[estDate])
-//         dailyMap[estDate] = { count: 0, platformCount: 0, companyCount: 0 };
-//       dailyMap[estDate].count++;
-//       const source = detectMailSource(msg.from);
-//       if (source === "platform") dailyMap[estDate].platformCount++;
-//       else dailyMap[estDate].companyCount++;
-//     });
-
-//     const allDates = [];
-//     let curr = moment.tz(from, "America/New_York");
-//     const end = moment.tz(to, "America/New_York");
-
-//     while (curr.isSameOrBefore(end)) {
-//       const day = curr.day();
-//       if (day !== 0 && day !== 6) {
-//         const dateStr = curr.format("YYYY-MM-DD");
-//         allDates.push({
-//           cycleStart: dateStr,
-//           count: dailyMap[dateStr]?.count || 0,
-//           platformCount: dailyMap[dateStr]?.platformCount || 0,
-//           companyCount: dailyMap[dateStr]?.companyCount || 0,
-//         });
-//       }
-//       curr.add(1, "day");
-//     }
-
-//     const totalCount = allDates.reduce((sum, d) => sum + d.count, 0);
-//     const platformCountTotal = allDates.reduce(
-//       (sum, d) => sum + d.platformCount,
-//       0
-//     );
-//     const companyCountTotal = allDates.reduce(
-//       (sum, d) => sum + d.companyCount,
-//       0
-//     );
-
-//     res.json({
-//       totalCount,
-//       platformCountTotal,
-//       companyCountTotal,
-//       dailyCounts: allDates,
-//     });
-//   } catch (err) {
-//     console.error("Report fetch error:", err);
-//     res.status(500).json({ error: "Failed to fetch report" });
-//   }
-// });
-
-// // -------------------- START SERVER --------------------
-// app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-
-
-
-
-
-// require("dotenv").config();
-// const express = require("express");
-// const cors = require("cors");
-// const { PrismaClient } = require("@prisma/client");
-// const { google } = require("googleapis");
-// const cron = require("node-cron");
-// const jwt = require("jsonwebtoken");
-// const moment = require("moment-timezone");
-
-// const prisma = new PrismaClient();
-// const app = express();
-// app.use(cors());
-// app.use(express.json());
-
-// const PORT = process.env.PORT || 5000;
-// const CLIENT_ID = process.env.CLIENT_ID || "";
-// const CLIENT_SECRET = process.env.CLIENT_SECRET || "";
-// const REDIRECT_URI =
-//   process.env.REDIRECT_URI || "http://localhost:5000/oauth2callback";
-// const CRON_INTERVAL = process.env.CRON_INTERVAL || 2; // in minutes
-
-// // -------------------- HEALTH CHECK --------------------
-// app.get("/", (req, res) => res.send({ status: "ok" }));
-
-// // -------------------- LOGIN --------------------
-// app.post("/login", (req, res) => {
-//   const { username, password } = req.body;
-//   const FIXED_USERNAME = "crr7t";
-//   const FIXED_PASSWORD = "ramramji";
-
-//   if (username === FIXED_USERNAME && password === FIXED_PASSWORD) {
-//     const token = jwt.sign({ username }, "supersecretkey", { expiresIn: "1h" });
-//     return res.json({ token, username });
-//   }
-//   return res.status(401).json({ error: "Invalid username or password" });
-// });
-
-// // -------------------- ADD CANDIDATE --------------------
-// app.post("/candidates", async (req, res) => {
-//   const { name, email } = req.body;
-//   if (!name || !email)
-//     return res.status(400).json({ error: "name and email required" });
-
-//   try {
-//     const newCandidate = await prisma.candidate.create({
-//       data: { name, email, count: 0, platformCount: 0, companyCount: 0 },
-//     });
-//     res.status(201).json(newCandidate);
-//   } catch (err) {
-//     console.error("Error adding candidate:", err.message || err);
-//     if (err.code === "P2002")
-//       return res
-//         .status(409)
-//         .json({ error: "Candidate with this email already exists" });
-//     res.status(500).json({ error: "Failed to add candidate" });
-//   }
-// });
-
-// // -------------------- DELETE CANDIDATE --------------------
-// app.delete("/candidates/:id", async (req, res) => {
-//   try {
-//     const { id } = req.params;
-//     await prisma.message.deleteMany({ where: { candidateId: parseInt(id) } });
-//     await prisma.candidate.delete({ where: { id: parseInt(id) } });
-//     res.json({ success: true, message: "Candidate deleted" });
-//   } catch (err) {
-//     console.error("Delete candidate error:", err.message || err);
-//     res.status(500).json({ error: "Failed to delete candidate" });
-//   }
-// });
-
-// // -------------------- AUTH --------------------
-// app.get("/auth/:candidateId", async (req, res) => {
-//   const { candidateId } = req.params;
-//   const oAuth2Client = new google.auth.OAuth2(
-//     CLIENT_ID,
-//     CLIENT_SECRET,
-//     REDIRECT_URI
-//   );
-//   const authUrl = oAuth2Client.generateAuthUrl({
-//     access_type: "offline",
-//     scope: ["https://www.googleapis.com/auth/gmail.readonly"],
-//     state: candidateId,
-//     prompt: "consent",
-//   });
-//   res.redirect(authUrl);
-// });
-
-// app.get("/oauth2callback", async (req, res) => {
-//   try {
-//     const code = req.query.code;
-//     const candidateId = req.query.state;
-//     if (!code || !candidateId)
-//       return res.status(400).send("Missing code or state.");
-
-//     const oAuth2Client = new google.auth.OAuth2(
-//       CLIENT_ID,
-//       CLIENT_SECRET,
-//       REDIRECT_URI
-//     );
-//     const { tokens } = await oAuth2Client.getToken(code);
-//     oAuth2Client.setCredentials(tokens);
-
-//     const profile = await google
-//       .gmail({ version: "v1", auth: oAuth2Client })
-//       .users.getProfile({ userId: "me" });
-//     const googleEmail = profile?.data?.emailAddress || "";
-
-//     const candidate = await prisma.candidate.findUnique({
-//       where: { id: parseInt(candidateId) },
-//     });
-//     if (!candidate) return res.status(404).send("Candidate not found.");
-//     if (
-//       candidate.email.toLowerCase().trim() !== googleEmail.toLowerCase().trim()
-//     )
-//       return res
-//         .status(400)
-//         .send(
-//           `Authorized Google account (${googleEmail}) does not match candidate email (${candidate.email}).`
-//         );
-
-//     await prisma.candidate.update({
-//       where: { id: candidate.id },
-//       data: {
-//         accessToken: tokens.access_token || null,
-//         refreshToken: tokens.refresh_token || null,
-//       },
-//     });
-
-//     res.send("✅ OAuth Success — account verified and tokens saved.");
-//   } catch (err) {
-//     console.error("OAuth callback error:", err.message || err);
-//     res.status(500).send("OAuth failed");
-//   }
-// });
-
-// // -------------------- DETECT MAIL SOURCE --------------------
-// function detectMailSource(fromEmail) {
-//   if (!fromEmail || fromEmail === "Unknown") return "company";
-
-//   const email = fromEmail.toLowerCase();
-//   const platforms = [
-//     "linkedin.com",
-//     "indeed.com",
-//     "glassdoor.com",
-//     "simplyhired.com",
-//     "dice.com",
-//     "monster.com",
-//     "careerbuilder.com",
-//     "apexsystems.com",
-//     "ziprecruiter.com",
-//     "randstad.com",
-//     "roberthalf.com",
-//     "brooksource.com",
-//     "insightglobal.com",
-//     "teksystems.com",
-//     "kforce.com",
-//     "levels.fyi",
-//     "talenty.io",
-//     "jobright.com",
-//     "swooped.com",
-//     "simplify.com",
-//     "builtin.com",
-//     "workable.com",
-//   ];
-
-//   return platforms.some((domain) => email.includes(domain))
-//     ? "platform"
-//     : "company";
-// }
-
-// // -------------------- CHECK MAILS & UPDATE COUNT --------------------
-// // Helper: recursively extract text from payload
-// function extractAllTextFromPayload(payload) {
-//   let acc = "";
-
-//   function walk(part) {
-//     if (!part) return;
-//     if (part.body && part.body.data) {
-//       try {
-//         acc += Buffer.from(part.body.data, "base64").toString("utf-8") + " ";
-//       } catch (e) {}
-//     }
-//     if (part.parts && Array.isArray(part.parts)) {
-//       part.parts.forEach(walk);
-//     }
-//   }
-
-//   walk(payload);
-//   // strip tags
-//   acc = acc.replace(/<[^>]+>/g, " ");
-//   // decode common HTML entities
-//   acc = acc.replace(/&nbsp;|&amp;|&lt;|&gt;|&quot;|&#39;/g, " ");
-//   return acc;
-// }
-
-// async function checkMailsAndUpdateCount() {
-//   const subjects = [
-//     "Thank you for applying",
-//     "Thank you for applying!",
-//     "Submission Received",
-//     "Thanks for applying",
-//     "Submission Confirmation",
-//     "We received your",
-//     "Application Received",
-//     "Your application for the position",
-//     "Your recent application for the position",
-//     "we've received",
-//     "We have successfully received your application",
-//     "Submitted:",
-//     "we have received",
-//     "submitted",
-//     "your application was sent",
-//     "submission",
-//     "Thank you for your application",
-//     "Thank you for your application!",
-//     "Thank you for the application",
-//     "Application was received",
-//     "Thanks for your application",
-//     "Thanks for completing your application",
-//     "has been received",
-//     "Indeed Application:",
-//     "We received your application",
-//     "we received your job application",
-//     "we received job application",
-//     "Application Acknowledgement",
-//     "Thank you for your interest",
-//     "Thank you for your job application",
-//     "your resume was received",
-//     "Thank you for submitting your application",
-//   ];
-
-//   const query =
-//     "subject:(" + subjects.map((s) => `\"${s}\"`).join(" OR ") + ")";
-//   const maxFetch = 100000;
-
-//   // Relaxed reject regex (company mails ke liye)
-//   const rejectRegex =
-//     /(not|unable|unfortunately|pursue other candidates|with other candidates|regret to inform|declined|position has been filled|no longer under consideration|unfortunate|another candidate)/i;
-//   const forwardRegex = /forwarded message|-----original message-----/i;
-
-//   const candidates = await prisma.candidate.findMany({
-//     where: { refreshToken: { not: null } },
-//   });
-//   if (!candidates || candidates.length === 0) return;
-
-//   for (const candidate of candidates) {
-//     if (!candidate.accessToken && !candidate.refreshToken) continue;
-
-//     try {
-//       const client = new google.auth.OAuth2(
-//         CLIENT_ID,
-//         CLIENT_SECRET,
-//         REDIRECT_URI
-//       );
-//       client.setCredentials({
-//         access_token: candidate.accessToken,
-//         refresh_token: candidate.refreshToken,
-//       });
-//       const gmail = google.gmail({ version: "v1", auth: client });
-
-//       let allMessages = [];
-//       let nextPageToken = null;
-
-//       do {
-//         const listRes = await gmail.users.messages.list({
-//           userId: "me",
-//           q: query,
-//           labelIds: ["INBOX"],
-//           maxResults: 100,
-//           pageToken: nextPageToken,
-//         });
-//         if (listRes.data.messages)
-//           allMessages = allMessages.concat(listRes.data.messages);
-//         nextPageToken = listRes.data.nextPageToken;
-//         if (allMessages.length >= maxFetch) break;
-//       } while (nextPageToken);
-
-//       allMessages = allMessages.slice(0, maxFetch);
-
-//       for (const m of allMessages) {
-//         const exists = await prisma.message.findUnique({ where: { id: m.id } });
-//         if (exists) continue;
-
-//         const msg = await gmail.users.messages.get({ userId: "me", id: m.id });
-//         const msgTime = parseInt(msg.data.internalDate);
-//         const msgDateUTC = new Date(msgTime);
-
-//         let fromHeader = "Unknown";
-//         let subject = "";
-//         let bodyRaw = "";
-
-//         if (msg.data?.payload?.headers) {
-//           for (const h of msg.data.payload.headers) {
-//             if (h.name.toLowerCase() === "from") fromHeader = h.value;
-//             if (h.name.toLowerCase() === "subject") subject = h.value || "";
-//           }
-//         }
-
-//         // Extract body recursively
-//         if (msg.data?.payload) {
-//           bodyRaw = extractAllTextFromPayload(msg.data.payload);
-//         }
-
-//         // Raw fallback if nothing found
-//         if (!bodyRaw || bodyRaw.trim().length < 10) {
-//           try {
-//             const rawMsg = await gmail.users.messages.get({
-//               userId: "me",
-//               id: m.id,
-//               format: "raw",
-//             });
-//             bodyRaw = Buffer.from(rawMsg.data.raw, "base64").toString("utf-8");
-//           } catch (e) {}
-//         }
-
-//         // Normalize body & subject
-//         let body = bodyRaw
-//           .replace(/[\r\n]+/g, " ")
-//           .replace(/\u00A0/g, " ") // NBSP
-//           .replace(/\u200B/g, "") // zero-width space
-//           .replace(/\u00AD/g, "") // soft hyphen
-//           .replace(/\s+/g, " ")
-//           .trim()
-//           .toLowerCase();
-//         subject = subject.toLowerCase();
-//         // Skip rejected or forwarded mails (subject wise filter)
-//    if (
-//   subject.includes("thank you for your interest") &&
-//   (rejectRegex.test(body) || forwardRegex.test(body))
-// ) {
-//   continue;
-// }
-
-
-//         const source = detectMailSource(fromHeader);
-
-//         await prisma.message.create({
-//           data: {
-//             id: m.id,
-//             candidateId: candidate.id,
-//             createdAt: msgDateUTC,
-//             from: fromHeader,
-//           },
-//         });
-
-//         const updateTotalData = { count: { increment: 1 } };
-//         if (source === "platform")
-//           updateTotalData.platformCount = { increment: 1 };
-//         else updateTotalData.companyCount = { increment: 1 };
-
-//         await prisma.candidate.update({
-//           where: { id: candidate.id },
-//           data: updateTotalData,
-//         });
-//       }
-//     } catch (err) {
-//       console.error(`Error processing ${candidate.email}:`, err);
-//     }
-//   }
-// }
-
-
-// // -------------------- CRON JOB --------------------
-// cron.schedule(`*/${CRON_INTERVAL} * * * *`, () => {
-//   console.log("⏰ Running mail check every", CRON_INTERVAL, "minutes");
-//   checkMailsAndUpdateCount();
-// });
-
-// // -------------------- GET CANDIDATES --------------------
-// app.get("/candidates", async (req, res) => {
-//   try {
-//     const candidates = await prisma.candidate.findMany({
-//       include: { messages: true },
-//       orderBy: { createdAt: "desc" },
-//     });
-
-//     const result = candidates.map((c) => {
-//       let dailyCount = 0;
-//       const todayEST = new Date().toLocaleString("en-US", {
-//         timeZone: "America/New_York",
-//       });
-//       const todayStr = new Date(todayEST).toISOString().split("T")[0];
-
-//       c.messages.forEach((msg) => {
-//         const msgEST = new Date(
-//           msg.createdAt.toLocaleString("en-US", {
-//             timeZone: "America/New_York",
-//           })
-//         );
-//         const msgDateStr = msgEST.toISOString().split("T")[0];
-//         if (msgDateStr === todayStr) dailyCount++;
-//       });
-
-//       return {
-//         id: c.id,
-//         name: c.name,
-//         email: c.email,
-//         totalCount: c.count,
-//         platformCount: c.platformCount,
-//         companyCount: c.companyCount,
-//         dailyCount,
-//         accessToken: c.accessToken,
-//       };
-//     });
-
-//     res.json(result);
-//   } catch (err) {
-//     console.error("Get candidates error:", err);
-//     res.status(500).json({ error: "Failed to fetch candidates" });
-//   }
-// });
-
-// // -------------------- REPORT --------------------
-// app.get("/report", async (req, res) => {
-//   try {
-//     const { candidateId, from, to } = req.query;
-//     if (!candidateId || !from || !to)
-//       return res
-//         .status(400)
-//         .json({ error: "candidateId, from, and to required" });
-
-//     const candidate = await prisma.candidate.findUnique({
-//       where: { id: parseInt(candidateId) },
-//     });
-//     if (!candidate)
-//       return res.status(404).json({ error: "Candidate not found" });
-
-//     const fromDateUTC = moment
-//       .tz(`${from} 00:00:00`, "YYYY-MM-DD HH:mm:ss", "America/New_York")
-//       .utc()
-//       .toDate();
-//     const toDateUTC = moment
-//       .tz(`${to} 23:59:59`, "YYYY-MM-DD HH:mm:ss", "America/New_York")
-//       .utc()
-//       .toDate();
-
-//     const messages = await prisma.message.findMany({
-//       where: {
-//         candidateId: candidate.id,
-//         createdAt: { gte: fromDateUTC, lte: toDateUTC },
-//       },
-//       orderBy: { createdAt: "asc" },
-//     });
-
-//     const dailyMap = {};
-//     messages.forEach((msg) => {
-//       const estDate = moment(msg.createdAt)
-//         .tz("America/New_York")
-//         .format("YYYY-MM-DD");
-//       if (!dailyMap[estDate])
-//         dailyMap[estDate] = { count: 0, platformCount: 0, companyCount: 0 };
-//       dailyMap[estDate].count++;
-//       const source = detectMailSource(msg.from);
-//       if (source === "platform") dailyMap[estDate].platformCount++;
-//       else dailyMap[estDate].companyCount++;
-//     });
-
-//     const allDates = [];
-//     let curr = moment.tz(from, "America/New_York");
-//     const end = moment.tz(to, "America/New_York");
-
-//     while (curr.isSameOrBefore(end)) {
-//       const day = curr.day();
-//       if (day !== 0 && day !== 6) {
-//         const dateStr = curr.format("YYYY-MM-DD");
-//         allDates.push({
-//           cycleStart: dateStr,
-//           count: dailyMap[dateStr]?.count || 0,
-//           platformCount: dailyMap[dateStr]?.platformCount || 0,
-//           companyCount: dailyMap[dateStr]?.companyCount || 0,
-//         });
-//       }
-//       curr.add(1, "day");
-//     }
-
-//     const totalCount = allDates.reduce((sum, d) => sum + d.count, 0);
-//     const platformCountTotal = allDates.reduce(
-//       (sum, d) => sum + d.platformCount,
-//       0
-//     );
-//     const companyCountTotal = allDates.reduce(
-//       (sum, d) => sum + d.companyCount,
-//       0
-//     );
-
-//     res.json({
-//       totalCount,
-//       platformCountTotal,
-//       companyCountTotal,
-//       dailyCounts: allDates,
-//     });
-//   } catch (err) {
-//     console.error("Report fetch error:", err);
-//     res.status(500).json({ error: "Failed to fetch report" });
-//   }
-// });
-
-// // -------------------- START SERVER --------------------
-// app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-

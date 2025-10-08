@@ -4,10 +4,10 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql" // ya jo bhi tum use kar rahe ho
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
 }
-
 // -------------------- CANDIDATE TABLE --------------------
 model Candidate {
   id            Int          @id @default(autoincrement())
